@@ -1336,6 +1336,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "kv-sub-indexer"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "ctrlc",
+ "dotenv",
+ "fastnear-primitives",
+ "scylla",
+ "scylladb",
+ "serde",
+ "serde_json",
+ "suffix-fetcher",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

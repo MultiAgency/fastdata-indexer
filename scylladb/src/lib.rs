@@ -17,10 +17,10 @@ use std::sync::Arc;
 pub const SCYLLADB: &str = "scylladb";
 
 pub struct ScyllaDb {
-    insert_fastdata_query: PreparedStatement,
-    select_fastdata_query_by_suffix_from: PreparedStatement,
-    insert_last_processed_block_height_query: PreparedStatement,
-    select_last_processed_block_height_query: PreparedStatement,
+    pub insert_fastdata_query: PreparedStatement,
+    pub select_fastdata_query_by_suffix_from: PreparedStatement,
+    pub insert_last_processed_block_height_query: PreparedStatement,
+    pub select_last_processed_block_height_query: PreparedStatement,
 
     pub scylla_session: Session,
 }
