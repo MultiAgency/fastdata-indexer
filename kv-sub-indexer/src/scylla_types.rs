@@ -6,6 +6,7 @@ use scylla::statement::batch::{Batch, BatchType};
 use scylla::statement::prepared::PreparedStatement;
 use scylla::{DeserializeRow, SerializeRow};
 use scylladb::{ScyllaDb, SCYLLADB};
+use std::collections::HashMap;
 
 pub(crate) const SUFFIX: &str = "kv";
 
@@ -82,6 +83,11 @@ impl From<FastDataKv> for FastDataKvRow {
     }
 }
 
+// __fastdata_kv({ "foo/alex.near": "bar", "foo/bob.near": "moo"})
+// PRIMARY KEY ((predecessor_id), current_account_id, key)
+// "key" >= "foo/" and "key" < "foo/" + '\xff'
+// INDEX KEY ((current_account_id), key)
+
 pub(crate) async fn create_tables(scylla_db: &ScyllaDb) -> anyhow::Result<()> {
     let queries = [
         "CREATE TABLE IF NOT EXISTS s_kv (
@@ -98,10 +104,27 @@ pub(crate) async fn create_tables(scylla_db: &ScyllaDb) -> anyhow::Result<()> {
 
             key text,
             value text,
-            PRIMARY KEY ((predecessor_id), current_account_id, relative_path)
+            PRIMARY KEY ((predecessor_id), current_account_id, key, block_height, shard_id, receipt_index, action_index)
         )",
-        "CREATE INDEX IF NOT EXISTS idx_s_kv_tx_hash ON s_fastfs (tx_hash)",
-        "CREATE INDEX IF NOT EXISTS idx_s_kv_receipt_id ON s_fastfs (receipt_id)",
+
+        "CREATE TABLE IF NOT EXISTS s_kv_last (
+            receipt_id text,
+            action_index int,
+            tx_hash text,
+            signer_id text,
+            predecessor_id text,
+            current_account_id text,
+            block_height bigint,
+            block_timestamp bigint,
+            shard_id int,
+            receipt_index int,
+
+            key text,
+            value text,
+            PRIMARY KEY ((predecessor_id), current_account_id, key)
+        )",
+        //        "CREATE INDEX IF NOT EXISTS idx_s_kv_tx_hash ON s_kv (tx_hash)",
+        //        "CREATE INDEX IF NOT EXISTS idx_s_kv_receipt_id ON s_kv (receipt_id)",
     ];
     for query in queries.iter() {
         tracing::debug!(target: SCYLLADB, "Creating table: {}", query);
@@ -110,35 +133,62 @@ pub(crate) async fn create_tables(scylla_db: &ScyllaDb) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) async fn prepare_insert_query(
+pub(crate) async fn prepare_kv_insert_query(
     scylla_db: &ScyllaDb,
 ) -> anyhow::Result<PreparedStatement> {
     ScyllaDb::prepare_query(
         &scylla_db.scylla_session,
-    "INSERT INTO s_fastfs (receipt_id, action_index, tx_hash, signer_id, predecessor_id, current_account_id, block_height, block_timestamp, shard_id, receipt_index, key, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO s_kv (receipt_id, action_index, tx_hash, signer_id, predecessor_id, current_account_id, block_height, block_timestamp, shard_id, receipt_index, key, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         scylla::frame::types::Consistency::LocalQuorum,
     )
     .await
 }
 
+pub(crate) async fn prepare_kv_last_insert_query(
+    scylla_db: &ScyllaDb,
+) -> anyhow::Result<PreparedStatement> {
+    ScyllaDb::prepare_query(
+        &scylla_db.scylla_session,
+        "INSERT INTO s_kv_last (receipt_id, action_index, tx_hash, signer_id, predecessor_id, current_account_id, block_height, block_timestamp, shard_id, receipt_index, key, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        scylla::frame::types::Consistency::LocalQuorum,
+    )
+        .await
+}
+
 pub(crate) async fn add_kv_rows(
     scylla_db: &ScyllaDb,
-    insert_query: &PreparedStatement,
+    kv_insert_query: &PreparedStatement,
+    kv_last_insert_query: &PreparedStatement,
     rows: Vec<FastDataKv>,
     last_processed_block_height: BlockHeight,
 ) -> anyhow::Result<()> {
     let mut batch = Batch::new(BatchType::Logged);
-    let rows = rows
+    let kv_rows = rows
         .into_iter()
         .map(FastDataKvRow::from)
         .collect::<Vec<_>>();
-    for _kv in &rows {
-        batch.append_statement(insert_query.clone());
+    // Deduplicate kv_rows by key
+    let kv_last_rows = kv_rows
+        .iter()
+        .cloned()
+        .map(|row| (row.key.clone(), row))
+        .collect::<HashMap<_, _>>()
+        .into_iter()
+        .map(|(_k, v)| v)
+        .collect::<Vec<_>>();
+    for _kv in &kv_rows {
+        batch.append_statement(kv_insert_query.clone());
+    }
+    for _kv in &kv_last_rows {
+        batch.append_statement(kv_last_insert_query.clone());
     }
     batch.append_statement(scylla_db.insert_last_processed_block_height_query.clone());
     let mut values: Vec<&(dyn SerializeRow)> = vec![];
-    for kv in &rows {
+    for kv in &kv_rows {
         values.push(kv);
+    }
+    for kv_last in &kv_last_rows {
+        values.push(kv_last);
     }
     let last_processed_block_height_row = (SUFFIX.to_string(), last_processed_block_height as i64);
     values.push(&last_processed_block_height_row);

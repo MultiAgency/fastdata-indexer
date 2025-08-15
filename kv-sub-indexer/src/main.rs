@@ -1,6 +1,6 @@
 mod scylla_types;
 
-use crate::scylla_types::{add_kv_rows, create_tables, prepare_insert_query, FastDataKv, SUFFIX};
+use crate::scylla_types::{add_kv_rows, FastDataKv, SUFFIX};
 use dotenv::dotenv;
 use fastnear_primitives::near_indexer_primitives::types::BlockHeight;
 use fastnear_primitives::types::ChainId;
@@ -34,13 +34,17 @@ async fn main() {
 
     let scylladb = fetcher.get_scylladb();
 
-    create_tables(&scylladb)
+    scylla_types::create_tables(&scylladb)
         .await
         .expect("Error creating tables");
 
-    let insert_query = prepare_insert_query(&scylladb)
+    let kv_insert_query = scylla_types::prepare_kv_insert_query(&scylladb)
         .await
-        .expect("Error preparing insert query");
+        .expect("Error preparing kv insert query");
+
+    let kv_last_insert_query = scylla_types::prepare_kv_last_insert_query(&scylladb)
+        .await
+        .expect("Error preparing kv insert query");
 
     let last_processed_block_height = scylladb
         .get_last_processed_block_height(SUFFIX)
@@ -119,18 +123,24 @@ async fn main() {
                             };
                             rows.push(row);
                         }
+                        continue;
                     }
                 }
                 tracing::debug!(target: PROJECT_ID, "Received invalid Key-Value Fastdata");
-                continue;
             }
             SuffixFetcherUpdate::EndOfRange(block_height) => {
                 tracing::info!(target: PROJECT_ID, "Saving last processed block height {} with {} rows", block_height, rows.len());
-                let mut old_rows = vec![];
-                std::mem::swap(&mut rows, &mut old_rows);
-                add_kv_rows(&scylladb, &insert_query, old_rows, block_height)
-                    .await
-                    .expect("Error adding Key-Value rows to ScyllaDB");
+                let mut current_rows = vec![];
+                std::mem::swap(&mut rows, &mut current_rows);
+                add_kv_rows(
+                    &scylladb,
+                    &kv_insert_query,
+                    &kv_last_insert_query,
+                    current_rows,
+                    block_height,
+                )
+                .await
+                .expect("Error adding Key-Value rows to ScyllaDB");
                 if !is_running.load(Ordering::SeqCst) {
                     tracing::info!(target: PROJECT_ID, "Shutting down...");
                     break;
