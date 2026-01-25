@@ -1,6 +1,6 @@
 mod scylla_types;
 
-use crate::scylla_types::{add_kv_rows, FastDataKv, SUFFIX};
+use crate::scylla_types::{add_kv_rows, FastDataKv, INDEXER_ID, SUFFIX};
 use dotenv::dotenv;
 use fastnear_primitives::near_indexer_primitives::types::BlockHeight;
 use fastnear_primitives::types::ChainId;
@@ -47,7 +47,7 @@ async fn main() {
         .expect("Error preparing kv insert query");
 
     let last_processed_block_height = scylladb
-        .get_last_processed_block_height(SUFFIX)
+        .get_last_processed_block_height(INDEXER_ID)
         .await
         .expect("Error getting last processed block height");
 

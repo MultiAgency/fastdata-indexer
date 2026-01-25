@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 
 const PROJECT_ID: &str = "fastfs-sub-indexer";
 const SUFFIX: &str = "fastfs";
+const INDEXER_ID: &str = "fastfs_v2";
 
 #[tokio::main]
 async fn main() {
@@ -46,7 +47,7 @@ async fn main() {
         .expect("Error preparing insert query");
 
     let last_processed_block_height = scylladb
-        .get_last_processed_block_height(SUFFIX)
+        .get_last_processed_block_height(INDEXER_ID)
         .await
         .expect("Error getting last processed block height");
 
@@ -69,10 +70,11 @@ async fn main() {
     .expect("Error setting Ctrl+C handler");
 
     tracing::info!(target: PROJECT_ID,
-        "Starting {:?} {} fetcher from height {}",
+        "Starting {:?} {} fetcher from height {} with indexer ID {}",
         SUFFIX,
         chain_id,
         start_block_height,
+        INDEXER_ID
     );
 
     let (sender, mut receiver) = mpsc::channel(100);
@@ -116,6 +118,7 @@ async fn main() {
                                     content,
                                     offset: 0,
                                     full_size,
+                                    nonce: 0,
                                 };
                                 tracing::info!(target: PROJECT_ID, "FastFS data {} bytes: {}/{}/{}", fastfs_fastdata.content.as_ref().map(|v| v.len()).unwrap_or(0), fastfs_fastdata.predecessor_id, fastfs_fastdata.current_account_id, fastfs_fastdata.relative_path);
                                 add_fastfs_fastdata(&scylladb, &insert_query, fastfs_fastdata)
@@ -141,6 +144,7 @@ async fn main() {
                                     content: Some(partial_fs.content_chunk),
                                     offset: partial_fs.offset,
                                     full_size: partial_fs.full_size,
+                                    nonce: partial_fs.nonce,
                                 };
                                 tracing::info!(target: PROJECT_ID, "FastFS partial data {} bytes: {}/{}/{} offset {}", fastfs_fastdata.content.as_ref().map(|v| v.len()).unwrap_or(0), fastfs_fastdata.predecessor_id, fastfs_fastdata.current_account_id, fastfs_fastdata.relative_path, fastfs_fastdata.offset);
                                 add_fastfs_fastdata(&scylladb, &insert_query, fastfs_fastdata)
@@ -154,7 +158,7 @@ async fn main() {
             SuffixFetcherUpdate::EndOfRange(block_height) => {
                 tracing::info!(target: PROJECT_ID, "Saving last processed block height: {}", block_height);
                 scylladb
-                    .set_last_processed_block_height(SUFFIX, block_height)
+                    .set_last_processed_block_height(INDEXER_ID, block_height)
                     .await
                     .expect("Error setting last processed block height");
                 if !is_running.load(Ordering::SeqCst) {

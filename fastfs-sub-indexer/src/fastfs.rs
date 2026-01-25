@@ -34,6 +34,11 @@ pub struct PartialFastfs {
     /// The content chunk up to 1Mb (1048576 bytes). We assume zero bytes tail if the chunk is
     /// smaller than 1Mb, but inside the file.
     pub content_chunk: Vec<u8>,
+    /// A nonce to differentiate different uploads at the same relative path.
+    /// The nonce should match for all parts of the same file.
+    /// Max value is i32::MAX.
+    /// Min value should be 1, to differentiate from simple fastfs entries.
+    pub nonce: u32,
 }
 
 impl PartialFastfs {
@@ -41,7 +46,7 @@ impl PartialFastfs {
         if self.relative_path.len() > MAX_RELATIVE_PATH_LENGTH {
             return false;
         }
-        if self.offset % OFFSET_ALIGNMENT != 0 {
+        if self.offset % OFFSET_ALIGNMENT != 0 || self.offset >= MAX_FULL_SIZE {
             return false;
         }
         if self.full_size == 0 || self.full_size > MAX_FULL_SIZE {
@@ -51,6 +56,9 @@ impl PartialFastfs {
             return false;
         }
         if self.content_chunk.len() > OFFSET_ALIGNMENT as usize {
+            return false;
+        }
+        if self.nonce == 0 || self.nonce > i32::MAX as u32 {
             return false;
         }
         true

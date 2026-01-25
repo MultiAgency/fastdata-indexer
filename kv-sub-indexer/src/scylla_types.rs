@@ -9,6 +9,7 @@ use scylladb::{ScyllaDb, SCYLLADB};
 use std::collections::HashMap;
 
 pub(crate) const SUFFIX: &str = "kv";
+pub(crate) const INDEXER_ID: &str = "kv-1";
 
 #[derive(Debug, Clone)]
 pub struct FastDataKv {
@@ -204,7 +205,8 @@ pub(crate) async fn add_kv_rows(
     for kv_last in &kv_last_rows {
         values.push(kv_last);
     }
-    let last_processed_block_height_row = (SUFFIX.to_string(), last_processed_block_height as i64);
+    let last_processed_block_height_row =
+        (INDEXER_ID.to_string(), last_processed_block_height as i64);
     values.push(&last_processed_block_height_row);
 
     scylla_db.scylla_session.batch(&batch, values).await?;
