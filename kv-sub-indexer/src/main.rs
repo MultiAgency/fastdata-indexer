@@ -106,6 +106,7 @@ async fn main() {
                             }
                             let serialized_value = serde_json::to_string(value)
                                 .expect("Error serializing value in Key-Value Fastdata");
+                            let order_id = scylladb::compute_order_id(&fastdata);
                             let row = FastDataKv {
                                 receipt_id: fastdata.receipt_id,
                                 action_index: fastdata.action_index,
@@ -117,6 +118,7 @@ async fn main() {
                                 block_timestamp: fastdata.block_timestamp,
                                 shard_id: fastdata.shard_id,
                                 receipt_index: fastdata.receipt_index,
+                                order_id,
 
                                 key: key.clone(),
                                 value: serialized_value,

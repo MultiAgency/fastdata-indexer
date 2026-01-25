@@ -1,7 +1,9 @@
 use futures::StreamExt;
 mod types;
+mod utils;
 
 pub use crate::types::{FastData, UNIVERSAL_SUFFIX};
+pub use crate::utils::*;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::statement::prepared::PreparedStatement;

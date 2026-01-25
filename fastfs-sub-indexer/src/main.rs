@@ -90,32 +90,65 @@ async fn main() {
         match update {
             SuffixFetcherUpdate::FastData(fastdata) => {
                 tracing::info!(target: PROJECT_ID, "Received fastdata: {} {} {}", fastdata.block_height, fastdata.receipt_id, fastdata.action_index);
-                if let Ok(FastfsData::Simple(simple_fastfs)) = borsh::from_slice(&fastdata.data) {
-                    if simple_fastfs.is_valid() {
-                        let (mime_type, content) = simple_fastfs
-                            .content
-                            .map(|c| (Some(c.mime_type), Some(c.content)))
-                            .unwrap_or((None, None));
-                        let fastfs_fastdata = FastfsFastData {
-                            receipt_id: fastdata.receipt_id,
-                            action_index: fastdata.action_index,
-                            tx_hash: fastdata.tx_hash,
-                            signer_id: fastdata.signer_id,
-                            predecessor_id: fastdata.predecessor_id,
-                            current_account_id: fastdata.current_account_id,
-                            block_height: fastdata.block_height,
-                            block_timestamp: fastdata.block_timestamp,
-                            shard_id: fastdata.shard_id,
-                            receipt_index: fastdata.receipt_index,
-                            mime_type,
-                            relative_path: simple_fastfs.relative_path,
-                            content,
-                        };
-                        tracing::info!(target: PROJECT_ID, "FastFS data {} bytes: {}/{}/{}", fastfs_fastdata.content.as_ref().map(|v| v.len()).unwrap_or(0), fastfs_fastdata.predecessor_id, fastfs_fastdata.current_account_id, fastfs_fastdata.relative_path);
-                        add_fastfs_fastdata(&scylladb, &insert_query, fastfs_fastdata)
-                            .await
-                            .expect("Error adding FastFS data to ScyllaDB");
-                    }
+                if let Ok(value) = borsh::from_slice(&fastdata.data) {
+                    match value {
+                        FastfsData::Simple(simple_fastfs) => {
+                            if simple_fastfs.is_valid() {
+                                let (mime_type, content) = simple_fastfs
+                                    .content
+                                    .map(|c| (Some(c.mime_type), Some(c.content)))
+                                    .unwrap_or((None, None));
+                                let full_size =
+                                    content.as_ref().map(|c| c.len() as u32).unwrap_or(0);
+                                let fastfs_fastdata = FastfsFastData {
+                                    receipt_id: fastdata.receipt_id,
+                                    action_index: fastdata.action_index,
+                                    tx_hash: fastdata.tx_hash,
+                                    signer_id: fastdata.signer_id,
+                                    predecessor_id: fastdata.predecessor_id,
+                                    current_account_id: fastdata.current_account_id,
+                                    block_height: fastdata.block_height,
+                                    block_timestamp: fastdata.block_timestamp,
+                                    shard_id: fastdata.shard_id,
+                                    receipt_index: fastdata.receipt_index,
+                                    mime_type,
+                                    relative_path: simple_fastfs.relative_path,
+                                    content,
+                                    offset: 0,
+                                    full_size,
+                                };
+                                tracing::info!(target: PROJECT_ID, "FastFS data {} bytes: {}/{}/{}", fastfs_fastdata.content.as_ref().map(|v| v.len()).unwrap_or(0), fastfs_fastdata.predecessor_id, fastfs_fastdata.current_account_id, fastfs_fastdata.relative_path);
+                                add_fastfs_fastdata(&scylladb, &insert_query, fastfs_fastdata)
+                                    .await
+                                    .expect("Error adding FastFS data to ScyllaDB");
+                            }
+                        }
+                        FastfsData::Partial(partial_fs) => {
+                            if partial_fs.is_valid() {
+                                let fastfs_fastdata = FastfsFastData {
+                                    receipt_id: fastdata.receipt_id,
+                                    action_index: fastdata.action_index,
+                                    tx_hash: fastdata.tx_hash,
+                                    signer_id: fastdata.signer_id,
+                                    predecessor_id: fastdata.predecessor_id,
+                                    current_account_id: fastdata.current_account_id,
+                                    block_height: fastdata.block_height,
+                                    block_timestamp: fastdata.block_timestamp,
+                                    shard_id: fastdata.shard_id,
+                                    receipt_index: fastdata.receipt_index,
+                                    mime_type: Some(partial_fs.mime_type),
+                                    relative_path: partial_fs.relative_path,
+                                    content: Some(partial_fs.content_chunk),
+                                    offset: partial_fs.offset,
+                                    full_size: partial_fs.full_size,
+                                };
+                                tracing::info!(target: PROJECT_ID, "FastFS partial data {} bytes: {}/{}/{} offset {}", fastfs_fastdata.content.as_ref().map(|v| v.len()).unwrap_or(0), fastfs_fastdata.predecessor_id, fastfs_fastdata.current_account_id, fastfs_fastdata.relative_path, fastfs_fastdata.offset);
+                                add_fastfs_fastdata(&scylladb, &insert_query, fastfs_fastdata)
+                                    .await
+                                    .expect("Error adding FastFS partial data to ScyllaDB");
+                            }
+                        }
+                    };
                 }
             }
             SuffixFetcherUpdate::EndOfRange(block_height) => {

@@ -22,6 +22,7 @@ pub struct FastDataKv {
     pub block_timestamp: u64,
     pub shard_id: u32,
     pub receipt_index: u32,
+    pub order_id: u64,
 
     pub key: String,
     pub value: String,
@@ -39,6 +40,7 @@ pub(crate) struct FastDataKvRow {
     pub block_timestamp: i64,
     pub shard_id: i32,
     pub receipt_index: i32,
+    pub order_id: i64,
 
     pub key: String,
     pub value: String,
@@ -57,6 +59,7 @@ impl From<FastDataKvRow> for FastDataKv {
             block_timestamp: row.block_timestamp as u64,
             shard_id: row.shard_id as u32,
             receipt_index: row.receipt_index as u32,
+            order_id: row.order_id as u64,
 
             key: row.key,
             value: row.value,
@@ -77,6 +80,7 @@ impl From<FastDataKv> for FastDataKvRow {
             block_timestamp: data.block_timestamp as i64,
             shard_id: data.shard_id as i32,
             receipt_index: data.receipt_index as i32,
+            order_id: data.order_id as i64,
             key: data.key,
             value: data.value,
         }
@@ -101,12 +105,12 @@ pub(crate) async fn create_tables(scylla_db: &ScyllaDb) -> anyhow::Result<()> {
             block_timestamp bigint,
             shard_id int,
             receipt_index int,
+            order_id bigint,
 
             key text,
             value text,
-            PRIMARY KEY ((predecessor_id), current_account_id, key, block_height, shard_id, receipt_index, action_index)
+            PRIMARY KEY ((predecessor_id), current_account_id, key, block_height, order_id)
         )",
-
         "CREATE TABLE IF NOT EXISTS s_kv_last (
             receipt_id text,
             action_index int,
@@ -118,13 +122,23 @@ pub(crate) async fn create_tables(scylla_db: &ScyllaDb) -> anyhow::Result<()> {
             block_timestamp bigint,
             shard_id int,
             receipt_index int,
+            order_id bigint,
 
             key text,
             value text,
             PRIMARY KEY ((predecessor_id), current_account_id, key)
         )",
-        //        "CREATE INDEX IF NOT EXISTS idx_s_kv_tx_hash ON s_kv (tx_hash)",
-        //        "CREATE INDEX IF NOT EXISTS idx_s_kv_receipt_id ON s_kv (receipt_id)",
+        "CREATE MATERIALIZED VIEW mv_kv_key IF NOT EXISTS AS
+            SELECT * FROM s_kv
+            WHERE key IS NOT NULL
+            PRIMARY KEY((key), block_height, order_id, predecessor_id, current_account_id)
+        ",
+        "CREATE MATERIALIZED VIEW mv_kv_cur_key IF NOT EXISTS AS
+            SELECT * FROM s_kv
+            WHERE key IS NOT NULL
+            PRIMARY KEY((current_account_id), key, block_height, order_id, predecessor_id)
+        ", //        "CREATE INDEX IF NOT EXISTS idx_s_kv_tx_hash ON s_kv (tx_hash)",
+           //        "CREATE INDEX IF NOT EXISTS idx_s_kv_receipt_id ON s_kv (receipt_id)",
     ];
     for query in queries.iter() {
         tracing::debug!(target: SCYLLADB, "Creating table: {}", query);
@@ -138,7 +152,7 @@ pub(crate) async fn prepare_kv_insert_query(
 ) -> anyhow::Result<PreparedStatement> {
     ScyllaDb::prepare_query(
         &scylla_db.scylla_session,
-    "INSERT INTO s_kv (receipt_id, action_index, tx_hash, signer_id, predecessor_id, current_account_id, block_height, block_timestamp, shard_id, receipt_index, key, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO s_kv (receipt_id, action_index, tx_hash, signer_id, predecessor_id, current_account_id, block_height, block_timestamp, shard_id, receipt_index, order_id, key, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         scylla::frame::types::Consistency::LocalQuorum,
     )
     .await
@@ -149,7 +163,7 @@ pub(crate) async fn prepare_kv_last_insert_query(
 ) -> anyhow::Result<PreparedStatement> {
     ScyllaDb::prepare_query(
         &scylla_db.scylla_session,
-        "INSERT INTO s_kv_last (receipt_id, action_index, tx_hash, signer_id, predecessor_id, current_account_id, block_height, block_timestamp, shard_id, receipt_index, key, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO s_kv_last (receipt_id, action_index, tx_hash, signer_id, predecessor_id, current_account_id, block_height, block_timestamp, shard_id, receipt_index, order_id, key, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         scylla::frame::types::Consistency::LocalQuorum,
     )
         .await
