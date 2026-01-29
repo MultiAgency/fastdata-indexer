@@ -35,25 +35,35 @@ pub fn create_rustls_client_config() -> Arc<ClientConfig> {
     }
     let ca_cert_path =
         env::var("SCYLLA_SSL_CA").expect("SCYLLA_SSL_CA environment variable not set");
-    let client_cert_path =
-        env::var("SCYLLA_SSL_CERT").expect("SCYLLA_SSL_CERT environment variable not set");
-    let client_key_path =
-        env::var("SCYLLA_SSL_KEY").expect("SCYLLA_SSL_KEY environment variable not set");
+    let client_cert_path = env::var("SCYLLA_SSL_CERT").ok();
+    let client_key_path = env::var("SCYLLA_SSL_KEY").ok();
 
     let ca_certs = rustls::pki_types::CertificateDer::from_pem_file(ca_cert_path)
         .expect("Failed to load CA certs");
-    let client_certs = rustls::pki_types::CertificateDer::from_pem_file(client_cert_path)
-        .expect("Failed to load client certs");
-    let client_key = rustls::pki_types::PrivateKeyDer::from_pem_file(client_key_path)
-        .expect("Failed to load client key");
 
     let mut root_store = RootCertStore::empty();
     root_store.add(ca_certs).expect("Failed to add CA certs");
 
-    let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_client_auth_cert(vec![client_certs], client_key)
-        .expect("Failed to create client config");
+    let config = match (client_cert_path, client_key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            // mTLS: Load client certificate and key
+            let client_certs = rustls::pki_types::CertificateDer::from_pem_file(cert_path)
+                .expect("Failed to load client certs");
+            let client_key = rustls::pki_types::PrivateKeyDer::from_pem_file(key_path)
+                .expect("Failed to load client key");
+
+            ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_client_auth_cert(vec![client_certs], client_key)
+                .expect("Failed to create client config")
+        }
+        _ => {
+            // Server-only TLS: No client certificate (e.g., ScyllaDB Cloud with password auth)
+            ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        }
+    };
 
     Arc::new(config)
 }
@@ -64,9 +74,11 @@ impl ScyllaDb {
         let scylla_username = env::var("SCYLLA_USERNAME").expect("SCYLLA_USERNAME must be set");
         let scylla_password = env::var("SCYLLA_PASSWORD").expect("SCYLLA_PASSWORD must be set");
 
+        let tls_config = env::var("SCYLLA_SSL_CA").ok().map(|_| create_rustls_client_config());
+
         let session: Session = SessionBuilder::new()
             .known_node(scylla_url)
-            .tls_context(Some(create_rustls_client_config()))
+            .tls_context(tls_config)
             .authenticator_provider(Arc::new(
                 scylla::authentication::PlainTextAuthenticator::new(
                     scylla_username,
