@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 const PROJECT_ID: &str = "kv-sub-indexer";
 const MAX_NUM_KEYS: usize = 256;
 const MAX_KEY_LENGTH: usize = 1024;
+const MAX_VALUE_LENGTH: usize = 1_048_576;
 
 #[tokio::main]
 async fn main() {
@@ -112,9 +113,13 @@ async fn main() {
                                         "Failed to serialize JSON value for key {}: {:?}. Skipping entry.",
                                         key, e
                                     );
-                                    continue; // Skip this key-value pair
+                                    continue;
                                 }
                             };
+                            if serialized_value.len() > MAX_VALUE_LENGTH {
+                                tracing::debug!(target: PROJECT_ID, "Received Key-Value Fastdata with value too large: {} bytes", serialized_value.len());
+                                continue;
+                            }
                             let order_id = scylladb::compute_order_id(&fastdata);
                             let row = FastDataKv {
                                 receipt_id: fastdata.receipt_id,

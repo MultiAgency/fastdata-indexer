@@ -75,6 +75,9 @@ impl ScyllaDb {
         let scylla_password = env::var("SCYLLA_PASSWORD").expect("SCYLLA_PASSWORD must be set");
 
         let tls_config = env::var("SCYLLA_SSL_CA").ok().map(|_| create_rustls_client_config());
+        if tls_config.is_none() {
+            tracing::warn!("SCYLLA_SSL_CA not set - ScyllaDB connection is unencrypted");
+        }
 
         let session: Session = SessionBuilder::new()
             .known_node(scylla_url)

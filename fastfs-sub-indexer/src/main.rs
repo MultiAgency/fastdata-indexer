@@ -92,7 +92,14 @@ async fn main() {
         match update {
             SuffixFetcherUpdate::FastData(fastdata) => {
                 tracing::info!(target: PROJECT_ID, "Received fastdata: {} {} {}", fastdata.block_height, fastdata.receipt_id, fastdata.action_index);
-                if let Ok(value) = borsh::from_slice(&fastdata.data) {
+                let value: FastfsData = match borsh::from_slice(&fastdata.data) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::debug!(target: PROJECT_ID, "Failed to deserialize borsh data for receipt {} action {}, skipping", fastdata.receipt_id, fastdata.action_index);
+                        continue;
+                    }
+                };
+                {
                     match value {
                         FastfsData::Simple(simple_fastfs) => {
                             if simple_fastfs.is_valid() {
