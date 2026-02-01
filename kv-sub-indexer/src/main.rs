@@ -104,8 +104,17 @@ async fn main() {
                                 tracing::debug!(target: PROJECT_ID, "Received Key-Value Fastdata with invalid key: {}", key.len());
                                 continue;
                             }
-                            let serialized_value = serde_json::to_string(value)
-                                .expect("Error serializing value in Key-Value Fastdata");
+                            let serialized_value = match serde_json::to_string(value) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: PROJECT_ID,
+                                        "Failed to serialize JSON value for key {}: {:?}. Skipping entry.",
+                                        key, e
+                                    );
+                                    continue; // Skip this key-value pair
+                                }
+                            };
                             let order_id = scylladb::compute_order_id(&fastdata);
                             let row = FastDataKv {
                                 receipt_id: fastdata.receipt_id,
@@ -125,6 +134,59 @@ async fn main() {
                             };
                             rows.push(row);
                         }
+
+                        // Early flush to prevent unbounded memory growth
+                        if rows.len() >= 10_000 {
+                            tracing::info!(target: PROJECT_ID, "Early flush at {} rows for block {}", rows.len(), fastdata.block_height);
+                            let mut current_rows = vec![];
+                            std::mem::swap(&mut rows, &mut current_rows);
+
+                            // Retry data write with delays
+                            let delays = [1, 2, 4];
+                            let mut last_error = None;
+
+                            for (attempt, &delay_secs) in delays.iter().enumerate() {
+                                if attempt > 0 {
+                                    tracing::warn!(
+                                        target: PROJECT_ID,
+                                        "Retrying DB write (attempt {}/{}) after {}s delay",
+                                        attempt + 1, delays.len(), delay_secs
+                                    );
+                                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                                }
+
+                                match add_kv_rows(
+                                    &scylladb,
+                                    &kv_insert_query,
+                                    &kv_last_insert_query,
+                                    current_rows.clone(),
+                                    fastdata.block_height,
+                                ).await {
+                                    Ok(_) => {
+                                        last_error = None;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            target: PROJECT_ID,
+                                            "DB write failed (attempt {}): {:?}",
+                                            attempt + 1, e
+                                        );
+                                        last_error = Some(e);
+                                    }
+                                }
+                            }
+
+                            if let Some(e) = last_error {
+                                tracing::error!(
+                                    target: PROJECT_ID,
+                                    "Failed to write data after {} retries. Exiting to prevent data loss: {:?}",
+                                    delays.len(), e
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+
                         continue;
                     }
                 }
@@ -134,15 +196,52 @@ async fn main() {
                 tracing::info!(target: PROJECT_ID, "Saving last processed block height {} with {} rows", block_height, rows.len());
                 let mut current_rows = vec![];
                 std::mem::swap(&mut rows, &mut current_rows);
-                add_kv_rows(
-                    &scylladb,
-                    &kv_insert_query,
-                    &kv_last_insert_query,
-                    current_rows,
-                    block_height,
-                )
-                .await
-                .expect("Error adding Key-Value rows to ScyllaDB");
+
+                // Retry data write with delays
+                let delays = [1, 2, 4];
+                let mut last_error = None;
+
+                for (attempt, &delay_secs) in delays.iter().enumerate() {
+                    if attempt > 0 {
+                        tracing::warn!(
+                            target: PROJECT_ID,
+                            "Retrying DB write (attempt {}/{}) after {}s delay",
+                            attempt + 1, delays.len(), delay_secs
+                        );
+                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                    }
+
+                    match add_kv_rows(
+                        &scylladb,
+                        &kv_insert_query,
+                        &kv_last_insert_query,
+                        current_rows.clone(),
+                        block_height,
+                    ).await {
+                        Ok(_) => {
+                            last_error = None;
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                target: PROJECT_ID,
+                                "DB write failed (attempt {}): {:?}",
+                                attempt + 1, e
+                            );
+                            last_error = Some(e);
+                        }
+                    }
+                }
+
+                if let Some(e) = last_error {
+                    tracing::error!(
+                        target: PROJECT_ID,
+                        "Failed to write data after {} retries. Exiting to prevent data loss: {:?}",
+                        delays.len(), e
+                    );
+                    std::process::exit(1);
+                }
+
                 if !is_running.load(Ordering::SeqCst) {
                     tracing::info!(target: PROJECT_ID, "Shutting down...");
                     break;

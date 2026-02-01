@@ -47,15 +47,24 @@ pub(crate) struct FastDataKvRow {
     pub value: String,
 }
 
-impl From<FastDataKvRow> for FastDataKv {
-    fn from(row: FastDataKvRow) -> Self {
-        Self {
-            receipt_id: row.receipt_id.parse().unwrap(),
+impl TryFrom<FastDataKvRow> for FastDataKv {
+    type Error = anyhow::Error;
+
+    fn try_from(row: FastDataKvRow) -> anyhow::Result<Self> {
+        Ok(Self {
+            receipt_id: row.receipt_id.parse()
+                .map_err(|e| anyhow::anyhow!("Failed to parse receipt_id '{}': {:?}", row.receipt_id, e))?,
             action_index: row.action_index as u32,
-            tx_hash: row.tx_hash.map(|h| h.parse().unwrap()),
-            signer_id: row.signer_id.parse().unwrap(),
-            predecessor_id: row.predecessor_id.parse().unwrap(),
-            current_account_id: row.current_account_id.parse().unwrap(),
+            tx_hash: row.tx_hash
+                .map(|h| h.parse()
+                    .map_err(|e| anyhow::anyhow!("Failed to parse tx_hash '{}': {:?}", h, e)))
+                .transpose()?,
+            signer_id: row.signer_id.parse()
+                .map_err(|e| anyhow::anyhow!("Failed to parse signer_id '{}': {:?}", row.signer_id, e))?,
+            predecessor_id: row.predecessor_id.parse()
+                .map_err(|e| anyhow::anyhow!("Failed to parse predecessor_id '{}': {:?}", row.predecessor_id, e))?,
+            current_account_id: row.current_account_id.parse()
+                .map_err(|e| anyhow::anyhow!("Failed to parse current_account_id '{}': {:?}", row.current_account_id, e))?,
             block_height: row.block_height as u64,
             block_timestamp: row.block_timestamp as u64,
             shard_id: row.shard_id as u32,
@@ -64,7 +73,7 @@ impl From<FastDataKvRow> for FastDataKv {
 
             key: row.key,
             value: row.value,
-        }
+        })
     }
 }
 
@@ -170,6 +179,8 @@ pub(crate) async fn prepare_kv_last_insert_query(
         .await
 }
 
+const BATCH_CHUNK_SIZE: usize = 100;
+
 pub(crate) async fn add_kv_rows(
     scylla_db: &ScyllaDb,
     kv_insert_query: &PreparedStatement,
@@ -177,7 +188,6 @@ pub(crate) async fn add_kv_rows(
     rows: Vec<FastDataKv>,
     last_processed_block_height: BlockHeight,
 ) -> anyhow::Result<()> {
-    let mut batch = Batch::new(BatchType::Logged);
     let kv_rows = rows
         .into_iter()
         .map(FastDataKvRow::from)
@@ -188,28 +198,49 @@ pub(crate) async fn add_kv_rows(
         .cloned()
         .map(|row| (row.key.clone(), row))
         .collect::<HashMap<_, _>>()
-        .into_iter()
-        .map(|(_k, v)| v)
+        .into_values()
         .collect::<Vec<_>>();
-    for _kv in &kv_rows {
-        batch.append_statement(kv_insert_query.clone());
-    }
-    for _kv in &kv_last_rows {
-        batch.append_statement(kv_last_insert_query.clone());
-    }
-    batch.append_statement(scylla_db.insert_last_processed_block_height_query.clone());
-    let mut values: Vec<&dyn SerializeRow> = vec![];
-    for kv in &kv_rows {
-        values.push(kv);
-    }
-    for kv_last in &kv_last_rows {
-        values.push(kv_last);
-    }
+
     let last_processed_block_height_row =
         (INDEXER_ID.to_string(), last_processed_block_height as i64);
-    values.push(&last_processed_block_height_row);
 
-    scylla_db.scylla_session.batch(&batch, values).await?;
+    let chunks: Vec<&[FastDataKvRow]> = kv_rows.chunks(BATCH_CHUNK_SIZE).collect();
+    let num_chunks = chunks.len();
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let is_last = i == num_chunks - 1;
+        let mut batch = Batch::new(BatchType::Logged);
+        let mut values: Vec<&dyn SerializeRow> = vec![];
+
+        for kv in *chunk {
+            batch.append_statement(kv_insert_query.clone());
+            values.push(kv);
+        }
+
+        if is_last {
+            for kv_last in &kv_last_rows {
+                batch.append_statement(kv_last_insert_query.clone());
+                values.push(kv_last);
+            }
+            batch.append_statement(scylla_db.insert_last_processed_block_height_query.clone());
+            values.push(&last_processed_block_height_row);
+        }
+
+        scylla_db.scylla_session.batch(&batch, values).await?;
+    }
+
+    // No kv_rows: still write kv_last + checkpoint
+    if kv_rows.is_empty() {
+        let mut batch = Batch::new(BatchType::Logged);
+        let mut values: Vec<&dyn SerializeRow> = vec![];
+        for kv_last in &kv_last_rows {
+            batch.append_statement(kv_last_insert_query.clone());
+            values.push(kv_last);
+        }
+        batch.append_statement(scylla_db.insert_last_processed_block_height_query.clone());
+        values.push(&last_processed_block_height_row);
+        scylla_db.scylla_session.batch(&batch, values).await?;
+    }
 
     Ok(())
 }

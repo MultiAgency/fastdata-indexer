@@ -3,10 +3,12 @@ use fastnear_neardata_fetcher::fetcher;
 use fastnear_primitives::near_indexer_primitives::types::BlockHeight;
 use fastnear_primitives::near_primitives::views::{ActionView, ReceiptEnumView};
 use fastnear_primitives::types::ChainId;
+use futures::stream::{self, StreamExt};
 use scylladb::{FastData, ScyllaDb, UNIVERSAL_SUFFIX};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 const FASTDATA_PREFIX: &str = "__fastdata_";
@@ -51,13 +53,24 @@ async fn main() {
         .map(|num_threads| num_threads.parse().expect("Invalid number of threads"))
         .unwrap_or(8);
 
-    let client = reqwest::Client::new();
-    let last_block_height = fetcher::fetch_last_block(&client, chain_id)
-        .await
-        .unwrap()
-        .block
-        .header
-        .height;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .expect("Failed to create HTTP client");
+    let last_block_height = match fetcher::fetch_last_block(&client, chain_id).await {
+        Some(block) => block.block.header.height,
+        None => {
+            tracing::warn!(
+                target: PROJECT_ID,
+                "Failed to fetch last block from neardata. Using START_BLOCK_HEIGHT env var."
+            );
+            env::var("START_BLOCK_HEIGHT")
+                .expect("Cannot fetch last block and START_BLOCK_HEIGHT not set")
+                .parse()
+                .expect("Invalid START_BLOCK_HEIGHT")
+        }
+    };
 
     tracing::info!(target: PROJECT_ID, "Last neardata block height: {}", last_block_height);
 
@@ -134,8 +147,7 @@ async fn main() {
                             method_name, args, ..
                         } = action
                         {
-                            if method_name.starts_with(FASTDATA_PREFIX) {
-                                let suffix = method_name.strip_prefix(FASTDATA_PREFIX).unwrap();
+                            if let Some(suffix) = method_name.strip_prefix(FASTDATA_PREFIX) {
                                 data.push(FastData {
                                     receipt_id,
                                     action_index: action_index as _,
@@ -160,20 +172,45 @@ async fn main() {
         let current_time = std::time::SystemTime::now();
         let duration = current_time
             .duration_since(last_block_update)
-            .expect("Time went backwards");
+            .unwrap_or(block_update_interval); // Treat as elapsed if clock adjusted
         let mut need_to_save_last_processed_block_height = duration >= block_update_interval;
 
         if !data.is_empty() {
             tracing::info!(target: PROJECT_ID, "Inserting {} fastdata rows into Scylla", data.len());
-            let futures = futures::future::join_all(
-                data.into_iter().map(|fastdata| scylladb.add_data(fastdata)),
-            );
-            // Wait for all futures to complete
-            let result = futures.await.into_iter().collect::<anyhow::Result<()>>();
-            if let Err(e) = result {
-                tracing::error!(target: PROJECT_ID, "Error inserting data into Scylla: {:?}", e);
-                panic!("TODO retry: {:?}", e);
+
+            let mut success = false;
+            let delays = [0, 1, 2, 4]; // 0 for first attempt, then 1s, 2s, 4s for retries
+
+            for (attempt, &delay_secs) in delays.iter().enumerate() {
+                if delay_secs > 0 {
+                    tracing::info!(target: PROJECT_ID, "Retrying insertion (attempt {}/{}) after {}s delay", attempt, delays.len() - 1, delay_secs);
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                }
+
+                let result = stream::iter(data.iter().map(|fastdata| scylladb.add_data(fastdata.clone())))
+                    .buffer_unordered(100)
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect::<anyhow::Result<()>>();
+
+                if result.is_ok() {
+                    success = true;
+                    break;
+                } else if let Err(e) = result {
+                    tracing::error!(target: PROJECT_ID, "Error inserting data into Scylla (attempt {}): {:?}", attempt + 1, e);
+                }
             }
+
+            if !success {
+                tracing::error!(
+                    target: PROJECT_ID,
+                    "Failed to insert data after {} retries. Exiting to prevent data loss.",
+                    delays.len() - 1
+                );
+                std::process::exit(1);
+            }
+
             need_to_save_last_processed_block_height = true;
         }
 
@@ -184,11 +221,46 @@ async fn main() {
 
         if need_to_save_last_processed_block_height {
             tracing::info!(target: PROJECT_ID, "Saving last processed block height: {}", block_height);
-            scylladb
-                .set_last_processed_block_height(UNIVERSAL_SUFFIX, block_height)
-                .await
-                .expect("Error setting last processed block height");
-            last_block_update = current_time;
+
+            // Retry checkpoint write with delays
+            let checkpoint_delays = [1, 2, 4];
+            let mut checkpoint_success = false;
+
+            for (attempt, &delay_secs) in checkpoint_delays.iter().enumerate() {
+                if attempt > 0 {
+                    tracing::warn!(
+                        target: PROJECT_ID,
+                        "Retrying checkpoint write (attempt {}/{}) after {}s delay",
+                        attempt + 1, checkpoint_delays.len(), delay_secs
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                }
+
+                match scylladb.set_last_processed_block_height(UNIVERSAL_SUFFIX, block_height).await {
+                    Ok(_) => {
+                        checkpoint_success = true;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: PROJECT_ID,
+                            "Checkpoint write failed (attempt {}): {:?}",
+                            attempt + 1, e
+                        );
+                    }
+                }
+            }
+
+            if checkpoint_success {
+                last_block_update = current_time;
+            } else {
+                tracing::error!(
+                    target: PROJECT_ID,
+                    "Failed to save checkpoint after {} retries. Will reprocess from last checkpoint on restart.",
+                    checkpoint_delays.len()
+                );
+                // Continue - reprocessing is safe due to idempotent DB inserts
+            }
         }
 
         if !is_running.load(Ordering::SeqCst) {

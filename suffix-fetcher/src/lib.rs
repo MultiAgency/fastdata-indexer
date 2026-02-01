@@ -77,57 +77,114 @@ impl SuffixFetcher {
         tracing::info!(target: FETCHER, "Starting suffix fetcher with suffix {:?} from {}", config.suffix, from_block_height);
         let mut last_fastdata_block_height = None;
         while is_running.load(Ordering::SeqCst) {
-            let last_block_height = self
+            let last_block_height = match self
                 .scylladb
                 .get_last_processed_block_height(UNIVERSAL_SUFFIX)
                 .await
-                .expect("Error getting last processed block height");
-            if last_block_height.is_none() {
+            {
+                Ok(height) => height,
+                Err(e) => {
+                    tracing::error!(
+                        target: FETCHER,
+                        "Error getting last block height: {:?}. Retrying in 1s...",
+                        e
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+            let Some(last_block_height) = last_block_height else {
                 tracing::info!(target: FETCHER, "No last processed block height found");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
-            }
-            let last_block_height = last_block_height.unwrap();
+            };
             if from_block_height > last_block_height {
                 tracing::debug!(target: FETCHER, "Waiting for new blocks");
                 tokio::time::sleep(config.sleep_duration).await;
                 continue;
             }
             tracing::info!(target: FETCHER, "Fetching blocks from {} to {}", from_block_height, last_block_height);
-            let mut stream = self
-                .scylladb
-                .get_suffix_data(&config.suffix, from_block_height, last_block_height)
-                .await
-                .expect("Error getting suffix data");
-            while let Some(fastdata) = stream.next().await {
-                if !is_running.load(Ordering::SeqCst) {
-                    break;
+
+            let mut range_success = false;
+            let delays = [0, 1, 2, 4]; // 0 for first attempt, then 1s, 2s, 4s for retries
+
+            for (attempt, &delay_secs) in delays.iter().enumerate() {
+                if delay_secs > 0 {
+                    tracing::info!(target: FETCHER, "Retrying range fetch (attempt {}/{}) after {}s delay", attempt, delays.len() - 1, delay_secs);
+                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                 }
-                match fastdata {
-                    Ok(fastdata) => {
-                        if let Some(last_fastdata_block_height) = last_fastdata_block_height {
-                            if fastdata.block_height > last_fastdata_block_height {
-                                sink.send(SuffixFetcherUpdate::EndOfRange(
-                                    last_fastdata_block_height,
-                                ))
+
+                let mut stream = match self
+                    .scylladb
+                    .get_suffix_data(&config.suffix, from_block_height, last_block_height)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(
+                            target: FETCHER,
+                            "Error getting suffix data (attempt {}): {:?}",
+                            attempt + 1, e
+                        );
+                        // Continue to next retry attempt
+                        continue;
+                    }
+                };
+
+                let mut had_error = false;
+                while let Some(fastdata) = stream.next().await {
+                    if !is_running.load(Ordering::SeqCst) {
+                        range_success = true;
+                        break;
+                    }
+                    match fastdata {
+                        Ok(fastdata) => {
+                            if let Some(last_fastdata_block_height) = last_fastdata_block_height {
+                                if fastdata.block_height > last_fastdata_block_height
+                                    && sink.send(SuffixFetcherUpdate::EndOfRange(
+                                        last_fastdata_block_height,
+                                    ))
+                                    .await
+                                    .is_err()
+                                {
+                                    tracing::warn!(target: FETCHER, "Channel closed, stopping");
+                                    range_success = true;
+                                    break;
+                                }
+                            }
+                            last_fastdata_block_height = Some(fastdata.block_height);
+                            if sink.send(fastdata.into())
                                 .await
-                                .expect("Error sending end of range to sink");
+                                .is_err() {
+                                tracing::warn!(target: FETCHER, "Channel closed, stopping");
+                                range_success = true;
+                                break;
                             }
                         }
-                        last_fastdata_block_height = Some(fastdata.block_height);
-                        sink.send(fastdata.into())
-                            .await
-                            .expect("Error sending fastdata to sink");
-                    }
-                    Err(e) => {
-                        tracing::error!(target: FETCHER, "Error fetching fastdata: {:?}", e);
-                        panic!("TODO: Error fetching fastdata: {:?}", e);
+                        Err(e) => {
+                            tracing::error!(target: FETCHER, "Error fetching fastdata (attempt {}): {:?}", attempt + 1, e);
+                            had_error = true;
+                            break;
+                        }
                     }
                 }
+
+                if !had_error {
+                    range_success = true;
+                    break;
+                }
             }
-            sink.send(SuffixFetcherUpdate::EndOfRange(last_block_height))
+
+            if !range_success {
+                tracing::error!(target: FETCHER, "Failed to fetch range after {} retries, continuing", delays.len() - 1);
+            }
+
+            if sink.send(SuffixFetcherUpdate::EndOfRange(last_block_height))
                 .await
-                .expect("Error sending end of range to sink");
+                .is_err() {
+                tracing::warn!(target: FETCHER, "Channel closed, stopping");
+                break;
+            }
             from_block_height = last_block_height + 1;
             last_fastdata_block_height = None;
         }

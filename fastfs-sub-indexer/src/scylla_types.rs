@@ -45,15 +45,24 @@ pub(crate) struct FastfsFastDataRow {
     pub nonce: i32,
 }
 
-impl From<FastfsFastDataRow> for FastfsFastData {
-    fn from(row: FastfsFastDataRow) -> Self {
-        Self {
-            receipt_id: row.receipt_id.parse().unwrap(),
+impl TryFrom<FastfsFastDataRow> for FastfsFastData {
+    type Error = anyhow::Error;
+
+    fn try_from(row: FastfsFastDataRow) -> anyhow::Result<Self> {
+        Ok(Self {
+            receipt_id: row.receipt_id.parse()
+                .map_err(|e| anyhow::anyhow!("Failed to parse receipt_id '{}': {:?}", row.receipt_id, e))?,
             action_index: row.action_index as u32,
-            tx_hash: row.tx_hash.map(|h| h.parse().unwrap()),
-            signer_id: row.signer_id.parse().unwrap(),
-            predecessor_id: row.predecessor_id.parse().unwrap(),
-            current_account_id: row.current_account_id.parse().unwrap(),
+            tx_hash: row.tx_hash
+                .map(|h| h.parse()
+                    .map_err(|e| anyhow::anyhow!("Failed to parse tx_hash '{}': {:?}", h, e)))
+                .transpose()?,
+            signer_id: row.signer_id.parse()
+                .map_err(|e| anyhow::anyhow!("Failed to parse signer_id '{}': {:?}", row.signer_id, e))?,
+            predecessor_id: row.predecessor_id.parse()
+                .map_err(|e| anyhow::anyhow!("Failed to parse predecessor_id '{}': {:?}", row.predecessor_id, e))?,
+            current_account_id: row.current_account_id.parse()
+                .map_err(|e| anyhow::anyhow!("Failed to parse current_account_id '{}': {:?}", row.current_account_id, e))?,
             block_height: row.block_height as u64,
             block_timestamp: row.block_timestamp as u64,
             shard_id: row.shard_id as u32,
@@ -64,7 +73,7 @@ impl From<FastfsFastDataRow> for FastfsFastData {
             offset: row.offset as u32,
             full_size: row.full_size as u32,
             nonce: row.nonce as u32,
-        }
+        })
     }
 }
 

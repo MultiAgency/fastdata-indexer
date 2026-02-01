@@ -121,9 +121,45 @@ async fn main() {
                                     nonce: 0,
                                 };
                                 tracing::info!(target: PROJECT_ID, "FastFS data {} bytes: {}/{}/{}", fastfs_fastdata.content.as_ref().map(|v| v.len()).unwrap_or(0), fastfs_fastdata.predecessor_id, fastfs_fastdata.current_account_id, fastfs_fastdata.relative_path);
-                                add_fastfs_fastdata(&scylladb, &insert_query, fastfs_fastdata)
-                                    .await
-                                    .expect("Error adding FastFS data to ScyllaDB");
+
+                                // Retry data write with delays
+                                let delays = [1, 2, 4];
+                                let mut last_error = None;
+
+                                for (attempt, &delay_secs) in delays.iter().enumerate() {
+                                    if attempt > 0 {
+                                        tracing::warn!(
+                                            target: PROJECT_ID,
+                                            "Retrying DB write (attempt {}/{}) after {}s delay",
+                                            attempt + 1, delays.len(), delay_secs
+                                        );
+                                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                                    }
+
+                                    match add_fastfs_fastdata(&scylladb, &insert_query, fastfs_fastdata.clone()).await {
+                                        Ok(_) => {
+                                            last_error = None;
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                target: PROJECT_ID,
+                                                "DB write failed (attempt {}): {:?}",
+                                                attempt + 1, e
+                                            );
+                                            last_error = Some(e);
+                                        }
+                                    }
+                                }
+
+                                if let Some(e) = last_error {
+                                    tracing::error!(
+                                        target: PROJECT_ID,
+                                        "Failed to write FastFS data after {} retries. Exiting to prevent data loss: {:?}",
+                                        delays.len(), e
+                                    );
+                                    std::process::exit(1);
+                                }
                             }
                         }
                         FastfsData::Partial(partial_fs) => {
@@ -147,9 +183,45 @@ async fn main() {
                                     nonce: partial_fs.nonce,
                                 };
                                 tracing::info!(target: PROJECT_ID, "FastFS partial data {} bytes: {}/{}/{} offset {}", fastfs_fastdata.content.as_ref().map(|v| v.len()).unwrap_or(0), fastfs_fastdata.predecessor_id, fastfs_fastdata.current_account_id, fastfs_fastdata.relative_path, fastfs_fastdata.offset);
-                                add_fastfs_fastdata(&scylladb, &insert_query, fastfs_fastdata)
-                                    .await
-                                    .expect("Error adding FastFS partial data to ScyllaDB");
+
+                                // Retry data write with delays
+                                let delays = [1, 2, 4];
+                                let mut last_error = None;
+
+                                for (attempt, &delay_secs) in delays.iter().enumerate() {
+                                    if attempt > 0 {
+                                        tracing::warn!(
+                                            target: PROJECT_ID,
+                                            "Retrying DB write (attempt {}/{}) after {}s delay",
+                                            attempt + 1, delays.len(), delay_secs
+                                        );
+                                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                                    }
+
+                                    match add_fastfs_fastdata(&scylladb, &insert_query, fastfs_fastdata.clone()).await {
+                                        Ok(_) => {
+                                            last_error = None;
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                target: PROJECT_ID,
+                                                "DB write failed (attempt {}): {:?}",
+                                                attempt + 1, e
+                                            );
+                                            last_error = Some(e);
+                                        }
+                                    }
+                                }
+
+                                if let Some(e) = last_error {
+                                    tracing::error!(
+                                        target: PROJECT_ID,
+                                        "Failed to write FastFS partial data after {} retries. Exiting to prevent data loss: {:?}",
+                                        delays.len(), e
+                                    );
+                                    std::process::exit(1);
+                                }
                             }
                         }
                     };
@@ -157,10 +229,45 @@ async fn main() {
             }
             SuffixFetcherUpdate::EndOfRange(block_height) => {
                 tracing::info!(target: PROJECT_ID, "Saving last processed block height: {}", block_height);
-                scylladb
-                    .set_last_processed_block_height(INDEXER_ID, block_height)
-                    .await
-                    .expect("Error setting last processed block height");
+
+                // Retry checkpoint write with delays
+                let checkpoint_delays = [1, 2, 4];
+                let mut checkpoint_success = false;
+
+                for (attempt, &delay_secs) in checkpoint_delays.iter().enumerate() {
+                    if attempt > 0 {
+                        tracing::warn!(
+                            target: PROJECT_ID,
+                            "Retrying checkpoint write (attempt {}/{}) after {}s delay",
+                            attempt + 1, checkpoint_delays.len(), delay_secs
+                        );
+                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                    }
+
+                    match scylladb.set_last_processed_block_height(INDEXER_ID, block_height).await {
+                        Ok(_) => {
+                            checkpoint_success = true;
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                target: PROJECT_ID,
+                                "Checkpoint write failed (attempt {}): {:?}",
+                                attempt + 1, e
+                            );
+                        }
+                    }
+                }
+
+                if !checkpoint_success {
+                    tracing::error!(
+                        target: PROJECT_ID,
+                        "Failed to save checkpoint after {} retries. Will reprocess from last checkpoint on restart.",
+                        checkpoint_delays.len()
+                    );
+                    // Continue - reprocessing is safe due to idempotent DB inserts
+                }
+
                 if !is_running.load(Ordering::SeqCst) {
                     tracing::info!(target: PROJECT_ID, "Shutting down...");
                     break;

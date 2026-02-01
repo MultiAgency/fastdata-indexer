@@ -41,12 +41,26 @@ pub struct PartialFastfs {
     pub nonce: u32,
 }
 
+fn is_valid_relative_path(path: &str) -> bool {
+    if path.is_empty()
+        || path.len() > MAX_RELATIVE_PATH_LENGTH
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || path.contains('\0')
+        || path.split('/').any(|c| c == "..")
+        || path.split('\\').any(|c| c == "..")
+    {
+        return false;
+    }
+    true
+}
+
 impl PartialFastfs {
     pub fn is_valid(&self) -> bool {
-        if self.relative_path.len() > MAX_RELATIVE_PATH_LENGTH {
+        if !is_valid_relative_path(&self.relative_path) {
             return false;
         }
-        if self.offset % OFFSET_ALIGNMENT != 0 || self.offset >= MAX_FULL_SIZE {
+        if !self.offset.is_multiple_of(OFFSET_ALIGNMENT) || self.offset >= MAX_FULL_SIZE {
             return false;
         }
         if self.full_size == 0 || self.full_size > MAX_FULL_SIZE {
@@ -67,7 +81,7 @@ impl PartialFastfs {
 
 impl SimpleFastfs {
     pub fn is_valid(&self) -> bool {
-        if self.relative_path.len() > MAX_RELATIVE_PATH_LENGTH {
+        if !is_valid_relative_path(&self.relative_path) {
             return false;
         }
         if let Some(content) = &self.content {
