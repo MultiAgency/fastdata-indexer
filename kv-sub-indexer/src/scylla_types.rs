@@ -204,39 +204,32 @@ pub(crate) async fn add_kv_rows(
     let last_processed_block_height_row =
         (INDEXER_ID.to_string(), last_processed_block_height as i64);
 
-    let chunks: Vec<&[FastDataKvRow]> = kv_rows.chunks(BATCH_CHUNK_SIZE).collect();
-    let num_chunks = chunks.len();
-
-    for (i, chunk) in chunks.iter().enumerate() {
-        let is_last = i == num_chunks - 1;
+    // Write kv_rows in chunks
+    for chunk in kv_rows.chunks(BATCH_CHUNK_SIZE) {
         let mut batch = Batch::new(BatchType::Logged);
         let mut values: Vec<&dyn SerializeRow> = vec![];
-
-        for kv in *chunk {
+        for kv in chunk {
             batch.append_statement(kv_insert_query.clone());
             values.push(kv);
         }
-
-        if is_last {
-            for kv_last in &kv_last_rows {
-                batch.append_statement(kv_last_insert_query.clone());
-                values.push(kv_last);
-            }
-            batch.append_statement(scylla_db.insert_last_processed_block_height_query.clone());
-            values.push(&last_processed_block_height_row);
-        }
-
         scylla_db.scylla_session.batch(&batch, values).await?;
     }
 
-    // No kv_rows: still write kv_last + checkpoint
-    if kv_rows.is_empty() {
+    // Write kv_last_rows in chunks
+    for chunk in kv_last_rows.chunks(BATCH_CHUNK_SIZE) {
         let mut batch = Batch::new(BatchType::Logged);
         let mut values: Vec<&dyn SerializeRow> = vec![];
-        for kv_last in &kv_last_rows {
+        for kv_last in chunk {
             batch.append_statement(kv_last_insert_query.clone());
             values.push(kv_last);
         }
+        scylla_db.scylla_session.batch(&batch, values).await?;
+    }
+
+    // Write checkpoint
+    {
+        let mut batch = Batch::new(BatchType::Logged);
+        let mut values: Vec<&dyn SerializeRow> = vec![];
         batch.append_statement(scylla_db.insert_last_processed_block_height_query.clone());
         values.push(&last_processed_block_height_row);
         scylla_db.scylla_session.batch(&batch, values).await?;
