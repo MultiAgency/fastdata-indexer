@@ -88,6 +88,9 @@ impl SimpleFastfs {
             if content.mime_type.is_empty() || content.mime_type.len() > MAX_MIME_TYPE_LENGTH {
                 return false;
             }
+            if content.content.len() > MAX_FULL_SIZE as usize {
+                return false;
+            }
         }
         true
     }

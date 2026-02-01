@@ -176,7 +176,9 @@ impl SuffixFetcher {
             }
 
             if !range_success {
-                tracing::error!(target: FETCHER, "Failed to fetch range after {} retries, continuing", delays.len() - 1);
+                tracing::error!(target: FETCHER, "Failed to fetch range after {} retries. Will retry same range.", delays.len() - 1);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
             }
 
             if sink.send(SuffixFetcherUpdate::EndOfRange(last_block_height))

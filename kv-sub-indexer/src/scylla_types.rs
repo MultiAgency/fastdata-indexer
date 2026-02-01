@@ -196,7 +196,7 @@ pub(crate) async fn add_kv_rows(
     let kv_last_rows = kv_rows
         .iter()
         .cloned()
-        .map(|row| (row.key.clone(), row))
+        .map(|row| ((row.predecessor_id.clone(), row.current_account_id.clone(), row.key.clone()), row))
         .collect::<HashMap<_, _>>()
         .into_values()
         .collect::<Vec<_>>();
