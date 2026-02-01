@@ -2,3 +2,4 @@
 /target
 res
 Cargo.lock
+.DS_Store
