@@ -275,6 +275,7 @@ CREATE TABLE blobs (
     receipt_id text,
     action_index int,
     suffix text,
+    block_height_bucket bigint,
     data blob,
     tx_hash text,
     signer_id text,
@@ -284,11 +285,8 @@ CREATE TABLE blobs (
     block_timestamp bigint,
     shard_id int,
     receipt_index int,
-    PRIMARY KEY ((suffix), block_height, shard_id, receipt_index, action_index, receipt_id)
+    PRIMARY KEY ((suffix, block_height_bucket), block_height, shard_id, receipt_index, action_index, receipt_id)
 );
-
-CREATE INDEX idx_tx_hash ON blobs (tx_hash);
-CREATE INDEX idx_receipt_id ON blobs (receipt_id);
 ```
 
 **Note:** main-indexer stores data with the actual suffix extracted from the method name (kv, fastfs, raw, etc.). The universal suffix (`*`) is only used in the `meta` table to track main-indexer's overall progress. Sub-indexers query `blobs` by specific suffixes.
@@ -419,11 +417,8 @@ CREATE TABLE s_fastfs_v2 (
     offset int,
     full_size int,
     nonce int,
-    PRIMARY KEY ((predecessor_id), current_account_id, relative_path, offset)
+    PRIMARY KEY ((predecessor_id), current_account_id, relative_path, nonce, offset)
 );
-
-CREATE INDEX idx_s_fastfs_v2_tx_hash ON s_fastfs_v2 (tx_hash);
-CREATE INDEX idx_s_fastfs_v2_receipt_id ON s_fastfs_v2 (receipt_id);
 ```
 
 ### FastData Core Fields
@@ -659,10 +654,12 @@ JSON-based key-value storage with automatic deduplication.
 
 **Validation:**
 
+- Max 4MB total data size per transaction
 - Max 256 keys per transaction
 - Max 1024 characters per key
-- Keys and values must be valid UTF-8
-- Deduplication: One value per key per block (if duplicate keys exist in same block, selection is non-deterministic)
+- Max 1MB per value
+- Keys must be non-empty, valid UTF-8, with no control characters
+- Deduplication: One value per key per block (if duplicate keys exist in same block, highest order_id wins)
 
 **Use Cases:**
 
@@ -713,10 +710,10 @@ SimpleFastfs {
 PartialFastfs {
     relative_path: String,      // Max 1024 bytes
     offset: u32,                // Must be 1MB aligned
-    mime_type: Option<String>,  // Max 256 bytes
-    content: Vec<u8>,           // Chunk content (up to 1MB)
+    mime_type: String,          // Required, max 256 bytes, ASCII only
+    content_chunk: Vec<u8>,     // Chunk content (up to 1MB)
     full_size: u32,             // Total file size (up to 32MB)
-    nonce: u32,                 // Upload session ID
+    nonce: u32,                 // Upload session ID (1..=i32::MAX)
 }
 ```
 
@@ -740,24 +737,24 @@ PartialFastfs {
 **Query Examples:**
 
 ```sql
--- Get complete file (all chunks)
+-- Get complete file (all chunks for a specific upload)
 SELECT * FROM s_fastfs_v2
 WHERE predecessor_id = 'user.near'
 AND current_account_id = 'storage.near'
-AND relative_path = '/images/avatar.png'
+AND relative_path = 'images/avatar.png'
+AND nonce = 42
 ORDER BY offset ASC;
 
--- List all files in directory
+-- List all files for an account
 SELECT DISTINCT relative_path FROM s_fastfs_v2
 WHERE predecessor_id = 'user.near'
 AND current_account_id = 'storage.near';
 
--- Get file metadata (first chunk)
+-- Get all uploads of a file (all nonces)
 SELECT * FROM s_fastfs_v2
 WHERE predecessor_id = 'user.near'
 AND current_account_id = 'storage.near'
-AND relative_path = '/images/avatar.png'
-AND offset = 0;
+AND relative_path = 'images/avatar.png';
 ```
 
 ### Custom Standards
@@ -894,14 +891,14 @@ cargo build --release --bin my-sub-indexer
 
 **Error Handling:**
 
-- Database write failures trigger panic (TODO: implement retry logic)
+- Database write failures retry with exponential backoff (1s, 2s, 4s), then shut down gracefully
 - Invalid data is logged and skipped
 - Malformed blobs don't affect other transactions
 
 **Consistency:**
 
 - LocalQuorum writes ensure durability across replicas
-- Logged batches for multi-row transactions
+- Unlogged batches for multi-row transactions (idempotent writes)
 - Order ID prevents duplicate processing
 
 ## Performance
