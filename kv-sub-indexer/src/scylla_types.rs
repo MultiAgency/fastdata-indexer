@@ -147,6 +147,13 @@ pub(crate) async fn create_tables(scylla_db: &ScyllaDb) -> anyhow::Result<()> {
             SELECT * FROM s_kv
             WHERE current_account_id IS NOT NULL AND key IS NOT NULL AND block_height IS NOT NULL AND order_id IS NOT NULL AND predecessor_id IS NOT NULL
             PRIMARY KEY((current_account_id), key, block_height, order_id, predecessor_id)
+        ",
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_kv_by_contract AS
+            SELECT predecessor_id, current_account_id, key, value
+            FROM s_kv_last
+            WHERE current_account_id IS NOT NULL AND predecessor_id IS NOT NULL AND key IS NOT NULL AND value IS NOT NULL
+            PRIMARY KEY ((current_account_id), predecessor_id, key)
+            WITH CLUSTERING ORDER BY (predecessor_id ASC, key ASC)
         ", //        "CREATE INDEX IF NOT EXISTS idx_s_kv_tx_hash ON s_kv (tx_hash)",
            //        "CREATE INDEX IF NOT EXISTS idx_s_kv_receipt_id ON s_kv (receipt_id)",
     ];
