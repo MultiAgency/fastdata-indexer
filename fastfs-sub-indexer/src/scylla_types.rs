@@ -52,7 +52,8 @@ impl TryFrom<FastfsFastDataRow> for FastfsFastData {
         Ok(Self {
             receipt_id: row.receipt_id.parse()
                 .map_err(|e| anyhow::anyhow!("Failed to parse receipt_id '{}': {:?}", row.receipt_id, e))?,
-            action_index: row.action_index as u32,
+            action_index: u32::try_from(row.action_index)
+                .map_err(|_| anyhow::anyhow!("Negative action_index in DB: {}", row.action_index))?,
             tx_hash: row.tx_hash
                 .map(|h| h.parse()
                     .map_err(|e| anyhow::anyhow!("Failed to parse tx_hash '{}': {:?}", h, e)))
@@ -63,16 +64,23 @@ impl TryFrom<FastfsFastDataRow> for FastfsFastData {
                 .map_err(|e| anyhow::anyhow!("Failed to parse predecessor_id '{}': {:?}", row.predecessor_id, e))?,
             current_account_id: row.current_account_id.parse()
                 .map_err(|e| anyhow::anyhow!("Failed to parse current_account_id '{}': {:?}", row.current_account_id, e))?,
-            block_height: row.block_height as u64,
-            block_timestamp: row.block_timestamp as u64,
-            shard_id: row.shard_id as u32,
-            receipt_index: row.receipt_index as u32,
+            block_height: u64::try_from(row.block_height)
+                .map_err(|_| anyhow::anyhow!("Negative block_height in DB: {}", row.block_height))?,
+            block_timestamp: u64::try_from(row.block_timestamp)
+                .map_err(|_| anyhow::anyhow!("Negative block_timestamp in DB: {}", row.block_timestamp))?,
+            shard_id: u32::try_from(row.shard_id)
+                .map_err(|_| anyhow::anyhow!("Negative shard_id in DB: {}", row.shard_id))?,
+            receipt_index: u32::try_from(row.receipt_index)
+                .map_err(|_| anyhow::anyhow!("Negative receipt_index in DB: {}", row.receipt_index))?,
             mime_type: row.mime_type,
             relative_path: row.relative_path,
             content: row.content,
-            offset: row.offset as u32,
-            full_size: row.full_size as u32,
-            nonce: row.nonce as u32,
+            offset: u32::try_from(row.offset)
+                .map_err(|_| anyhow::anyhow!("Negative offset in DB: {}", row.offset))?,
+            full_size: u32::try_from(row.full_size)
+                .map_err(|_| anyhow::anyhow!("Negative full_size in DB: {}", row.full_size))?,
+            nonce: u32::try_from(row.nonce)
+                .map_err(|_| anyhow::anyhow!("Negative nonce in DB: {}", row.nonce))?,
         })
     }
 }
@@ -81,21 +89,21 @@ impl From<FastfsFastData> for FastfsFastDataRow {
     fn from(data: FastfsFastData) -> Self {
         Self {
             receipt_id: data.receipt_id.to_string(),
-            action_index: data.action_index as i32,
+            action_index: i32::try_from(data.action_index).expect("action_index exceeds i32"),
             tx_hash: data.tx_hash.map(|h| h.to_string()),
             signer_id: data.signer_id.to_string(),
             predecessor_id: data.predecessor_id.to_string(),
             current_account_id: data.current_account_id.to_string(),
             block_height: data.block_height as i64,
             block_timestamp: data.block_timestamp as i64,
-            shard_id: data.shard_id as i32,
-            receipt_index: data.receipt_index as i32,
+            shard_id: i32::try_from(data.shard_id).expect("shard_id exceeds i32"),
+            receipt_index: i32::try_from(data.receipt_index).expect("receipt_index exceeds i32"),
             mime_type: data.mime_type,
             relative_path: data.relative_path,
             content: data.content,
-            offset: data.offset as i32,
-            full_size: data.full_size as i32,
-            nonce: data.nonce as i32,
+            offset: i32::try_from(data.offset).expect("offset exceeds i32"),
+            full_size: i32::try_from(data.full_size).expect("full_size exceeds i32"),
+            nonce: i32::try_from(data.nonce).expect("nonce exceeds i32"),
         }
     }
 }
@@ -119,10 +127,10 @@ pub(crate) async fn create_tables(scylla_db: &ScyllaDb) -> anyhow::Result<()> {
             offset int,
             full_size int,
             nonce int,
-            PRIMARY KEY ((predecessor_id), current_account_id, relative_path, offset)
+            PRIMARY KEY ((predecessor_id), current_account_id, relative_path, nonce, offset)
         )",
-        "CREATE INDEX IF NOT EXISTS idx_s_fastfs_v2_tx_hash ON s_fastfs_v2 (tx_hash)",
-        "CREATE INDEX IF NOT EXISTS idx_s_fastfs_v2_receipt_id ON s_fastfs_v2 (receipt_id)",
+        // Secondary indexes on high-cardinality columns removed (ScyllaDB anti-pattern).
+        // Use dedicated lookup tables if tx_hash/receipt_id queries are needed.
     ];
     for query in queries.iter() {
         tracing::debug!(target: SCYLLADB, "Creating table: {}", query);

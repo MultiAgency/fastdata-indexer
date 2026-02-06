@@ -4,6 +4,7 @@ use fastnear_primitives::near_indexer_primitives::CryptoHash;
 use scylla::{DeserializeRow, SerializeRow};
 
 pub const UNIVERSAL_SUFFIX: &str = "*";
+pub const BLOCK_HEIGHT_BUCKET_SIZE: u64 = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct FastData {
@@ -26,6 +27,7 @@ pub(crate) struct FastDataRow {
     pub receipt_id: String,
     pub action_index: i32,
     pub suffix: String,
+    pub block_height_bucket: i64,
     pub data: Vec<u8>,
     pub tx_hash: Option<String>,
     pub signer_id: String,
@@ -44,7 +46,8 @@ impl TryFrom<FastDataRow> for FastData {
         Ok(Self {
             receipt_id: row.receipt_id.parse()
                 .map_err(|e| anyhow::anyhow!("Failed to parse receipt_id '{}': {:?}", row.receipt_id, e))?,
-            action_index: row.action_index as u32,
+            action_index: u32::try_from(row.action_index)
+                .map_err(|_| anyhow::anyhow!("Negative action_index in DB: {}", row.action_index))?,
             suffix: row.suffix,
             data: row.data,
             tx_hash: row.tx_hash
@@ -57,10 +60,14 @@ impl TryFrom<FastDataRow> for FastData {
                 .map_err(|e| anyhow::anyhow!("Failed to parse predecessor_id '{}': {:?}", row.predecessor_id, e))?,
             current_account_id: row.current_account_id.parse()
                 .map_err(|e| anyhow::anyhow!("Failed to parse current_account_id '{}': {:?}", row.current_account_id, e))?,
-            block_height: row.block_height as u64,
-            block_timestamp: row.block_timestamp as u64,
-            shard_id: row.shard_id as u32,
-            receipt_index: row.receipt_index as u32,
+            block_height: u64::try_from(row.block_height)
+                .map_err(|_| anyhow::anyhow!("Negative block_height in DB: {}", row.block_height))?,
+            block_timestamp: u64::try_from(row.block_timestamp)
+                .map_err(|_| anyhow::anyhow!("Negative block_timestamp in DB: {}", row.block_timestamp))?,
+            shard_id: u32::try_from(row.shard_id)
+                .map_err(|_| anyhow::anyhow!("Negative shard_id in DB: {}", row.shard_id))?,
+            receipt_index: u32::try_from(row.receipt_index)
+                .map_err(|_| anyhow::anyhow!("Negative receipt_index in DB: {}", row.receipt_index))?,
         })
     }
 }
@@ -69,8 +76,9 @@ impl From<FastData> for FastDataRow {
     fn from(fastdata: FastData) -> Self {
         Self {
             receipt_id: fastdata.receipt_id.to_string(),
-            action_index: fastdata.action_index as i32,
+            action_index: i32::try_from(fastdata.action_index).expect("action_index exceeds i32"),
             suffix: fastdata.suffix,
+            block_height_bucket: (fastdata.block_height / BLOCK_HEIGHT_BUCKET_SIZE) as i64,
             data: fastdata.data,
             tx_hash: fastdata.tx_hash.map(|h| h.to_string()),
             signer_id: fastdata.signer_id.to_string(),
@@ -78,8 +86,8 @@ impl From<FastData> for FastDataRow {
             current_account_id: fastdata.current_account_id.to_string(),
             block_height: fastdata.block_height as i64,
             block_timestamp: fastdata.block_timestamp as i64,
-            shard_id: fastdata.shard_id as i32,
-            receipt_index: fastdata.receipt_index as i32,
+            shard_id: i32::try_from(fastdata.shard_id).expect("shard_id exceeds i32"),
+            receipt_index: i32::try_from(fastdata.receipt_index).expect("receipt_index exceeds i32"),
         }
     }
 }

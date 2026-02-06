@@ -6,7 +6,7 @@ use scylla::statement::batch::{Batch, BatchType};
 use scylla::statement::prepared::PreparedStatement;
 use scylla::{DeserializeRow, SerializeRow};
 use scylladb::{ScyllaDb, SCYLLADB};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub(crate) const SUFFIX: &str = "kv";
 pub(crate) const INDEXER_ID: &str = "kv-1";
@@ -54,7 +54,8 @@ impl TryFrom<FastDataKvRow> for FastDataKv {
         Ok(Self {
             receipt_id: row.receipt_id.parse()
                 .map_err(|e| anyhow::anyhow!("Failed to parse receipt_id '{}': {:?}", row.receipt_id, e))?,
-            action_index: row.action_index as u32,
+            action_index: u32::try_from(row.action_index)
+                .map_err(|_| anyhow::anyhow!("Negative action_index in DB: {}", row.action_index))?,
             tx_hash: row.tx_hash
                 .map(|h| h.parse()
                     .map_err(|e| anyhow::anyhow!("Failed to parse tx_hash '{}': {:?}", h, e)))
@@ -65,11 +66,16 @@ impl TryFrom<FastDataKvRow> for FastDataKv {
                 .map_err(|e| anyhow::anyhow!("Failed to parse predecessor_id '{}': {:?}", row.predecessor_id, e))?,
             current_account_id: row.current_account_id.parse()
                 .map_err(|e| anyhow::anyhow!("Failed to parse current_account_id '{}': {:?}", row.current_account_id, e))?,
-            block_height: row.block_height as u64,
-            block_timestamp: row.block_timestamp as u64,
-            shard_id: row.shard_id as u32,
-            receipt_index: row.receipt_index as u32,
-            order_id: row.order_id as u64,
+            block_height: u64::try_from(row.block_height)
+                .map_err(|_| anyhow::anyhow!("Negative block_height in DB: {}", row.block_height))?,
+            block_timestamp: u64::try_from(row.block_timestamp)
+                .map_err(|_| anyhow::anyhow!("Negative block_timestamp in DB: {}", row.block_timestamp))?,
+            shard_id: u32::try_from(row.shard_id)
+                .map_err(|_| anyhow::anyhow!("Negative shard_id in DB: {}", row.shard_id))?,
+            receipt_index: u32::try_from(row.receipt_index)
+                .map_err(|_| anyhow::anyhow!("Negative receipt_index in DB: {}", row.receipt_index))?,
+            order_id: u64::try_from(row.order_id)
+                .map_err(|_| anyhow::anyhow!("Negative order_id in DB: {}", row.order_id))?,
 
             key: row.key,
             value: row.value,
@@ -81,15 +87,15 @@ impl From<FastDataKv> for FastDataKvRow {
     fn from(data: FastDataKv) -> Self {
         Self {
             receipt_id: data.receipt_id.to_string(),
-            action_index: data.action_index as i32,
+            action_index: i32::try_from(data.action_index).expect("action_index exceeds i32"),
             tx_hash: data.tx_hash.map(|h| h.to_string()),
             signer_id: data.signer_id.to_string(),
             predecessor_id: data.predecessor_id.to_string(),
             current_account_id: data.current_account_id.to_string(),
             block_height: data.block_height as i64,
             block_timestamp: data.block_timestamp as i64,
-            shard_id: data.shard_id as i32,
-            receipt_index: data.receipt_index as i32,
+            shard_id: i32::try_from(data.shard_id).expect("shard_id exceeds i32"),
+            receipt_index: i32::try_from(data.receipt_index).expect("receipt_index exceeds i32"),
             order_id: data.order_id as i64,
             key: data.key,
             value: data.value,
@@ -148,14 +154,12 @@ pub(crate) async fn create_tables(scylla_db: &ScyllaDb) -> anyhow::Result<()> {
             WHERE current_account_id IS NOT NULL AND key IS NOT NULL AND block_height IS NOT NULL AND order_id IS NOT NULL AND predecessor_id IS NOT NULL
             PRIMARY KEY((current_account_id), key, block_height, order_id, predecessor_id)
         ",
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_kv_by_contract AS
-            SELECT predecessor_id, current_account_id, key, value
-            FROM s_kv_last
-            WHERE current_account_id IS NOT NULL AND predecessor_id IS NOT NULL AND key IS NOT NULL AND value IS NOT NULL
-            PRIMARY KEY ((current_account_id), predecessor_id, key)
-            WITH CLUSTERING ORDER BY (predecessor_id ASC, key ASC)
-        ", //        "CREATE INDEX IF NOT EXISTS idx_s_kv_tx_hash ON s_kv (tx_hash)",
-           //        "CREATE INDEX IF NOT EXISTS idx_s_kv_receipt_id ON s_kv (receipt_id)",
+        "CREATE TABLE IF NOT EXISTS kv_accounts (
+            current_account_id text,
+            key text,
+            predecessor_id text,
+            PRIMARY KEY ((current_account_id), key, predecessor_id)
+        )",
     ];
     for query in queries.iter() {
         tracing::debug!(target: SCYLLADB, "Creating table: {}", query);
@@ -186,34 +190,52 @@ pub(crate) async fn prepare_kv_last_insert_query(
         .await
 }
 
+pub(crate) async fn prepare_kv_accounts_insert_query(
+    scylla_db: &ScyllaDb,
+) -> anyhow::Result<PreparedStatement> {
+    ScyllaDb::prepare_query(
+        &scylla_db.scylla_session,
+        "INSERT INTO kv_accounts (current_account_id, key, predecessor_id) VALUES (?, ?, ?)",
+        scylla::frame::types::Consistency::LocalQuorum,
+    )
+    .await
+}
+
 const BATCH_CHUNK_SIZE: usize = 100;
 
 pub(crate) async fn add_kv_rows(
     scylla_db: &ScyllaDb,
     kv_insert_query: &PreparedStatement,
     kv_last_insert_query: &PreparedStatement,
-    rows: Vec<FastDataKv>,
-    last_processed_block_height: BlockHeight,
+    kv_accounts_insert_query: &PreparedStatement,
+    rows: &[FastDataKv],
+    last_processed_block_height: Option<BlockHeight>,
 ) -> anyhow::Result<()> {
-    let kv_rows = rows
-        .into_iter()
-        .map(FastDataKvRow::from)
-        .collect::<Vec<_>>();
-    // Deduplicate kv_rows by key
-    let kv_last_rows = kv_rows
+    let kv_rows: Vec<FastDataKvRow> = rows
         .iter()
         .cloned()
-        .map(|row| ((row.predecessor_id.clone(), row.current_account_id.clone(), row.key.clone()), row))
-        .collect::<HashMap<_, _>>()
-        .into_values()
-        .collect::<Vec<_>>();
-
-    let last_processed_block_height_row =
-        (INDEXER_ID.to_string(), last_processed_block_height as i64);
+        .map(FastDataKvRow::from)
+        .collect();
+    // Deduplicate kv_rows by key, keeping the row with the highest order_id
+    let mut kv_last_map: HashMap<(String, String, String), FastDataKvRow> = HashMap::new();
+    for row in kv_rows.iter().cloned() {
+        let dedup_key = (
+            row.predecessor_id.clone(),
+            row.current_account_id.clone(),
+            row.key.clone(),
+        );
+        match kv_last_map.get(&dedup_key) {
+            Some(existing) if (existing.block_height, existing.order_id) >= (row.block_height, row.order_id) => {}
+            _ => {
+                kv_last_map.insert(dedup_key, row);
+            }
+        }
+    }
+    let kv_last_rows: Vec<_> = kv_last_map.into_values().collect();
 
     // Write kv_rows in chunks
     for chunk in kv_rows.chunks(BATCH_CHUNK_SIZE) {
-        let mut batch = Batch::new(BatchType::Logged);
+        let mut batch = Batch::new(BatchType::Unlogged);
         let mut values: Vec<&dyn SerializeRow> = vec![];
         for kv in chunk {
             batch.append_statement(kv_insert_query.clone());
@@ -222,24 +244,52 @@ pub(crate) async fn add_kv_rows(
         scylla_db.scylla_session.batch(&batch, values).await?;
     }
 
-    // Write kv_last_rows in chunks
-    for chunk in kv_last_rows.chunks(BATCH_CHUNK_SIZE) {
-        let mut batch = Batch::new(BatchType::Logged);
+    // Write kv_last_rows with USING TIMESTAMP for deterministic last-write-wins ordering.
+    // This prevents stale overwrites on crash/replay: blockchain ordering always wins
+    // over wall-clock time, regardless of write order or duplicate writes.
+    for kv_last in &kv_last_rows {
+        // Encode (block_height, order_id) into a single i64 timestamp for deterministic LWW.
+        // Max order_id ≈ shard_count * 100_000 * 1_000 ≈ 600M (6 shards). With 1B multiplier,
+        // block_height can reach ~9.2B before i64 overflow (current NEAR height: ~150M).
+        let ts = (kv_last.block_height) * 1_000_000_000 + kv_last.order_id;
+        let mut stmt = kv_last_insert_query.clone();
+        stmt.set_timestamp(Some(ts));
+        scylla_db.scylla_session.execute_unpaged(&stmt, kv_last).await?;
+    }
+
+    // Write kv_accounts (unique tuples from kv_last_rows)
+    let account_tuples: HashSet<(&str, &str, &str)> = kv_last_rows
+        .iter()
+        .map(|row| (
+            row.current_account_id.as_str(),
+            row.key.as_str(),
+            row.predecessor_id.as_str(),
+        ))
+        .collect();
+    let account_tuples_vec: Vec<_> = account_tuples
+        .into_iter()
+        .map(|(a, k, p)| (a.to_string(), k.to_string(), p.to_string()))
+        .collect();
+    for chunk in account_tuples_vec.chunks(BATCH_CHUNK_SIZE) {
+        let mut batch = Batch::new(BatchType::Unlogged);
         let mut values: Vec<&dyn SerializeRow> = vec![];
-        for kv_last in chunk {
-            batch.append_statement(kv_last_insert_query.clone());
-            values.push(kv_last);
+        for tuple in chunk {
+            batch.append_statement(kv_accounts_insert_query.clone());
+            values.push(tuple);
         }
         scylla_db.scylla_session.batch(&batch, values).await?;
     }
 
-    // Write checkpoint
-    {
-        let mut batch = Batch::new(BatchType::Logged);
-        let mut values: Vec<&dyn SerializeRow> = vec![];
-        batch.append_statement(scylla_db.insert_last_processed_block_height_query.clone());
-        values.push(&last_processed_block_height_row);
-        scylla_db.scylla_session.batch(&batch, values).await?;
+    // Write checkpoint only when a block height is provided
+    if let Some(height) = last_processed_block_height {
+        let checkpoint_row = (INDEXER_ID.to_string(), height as i64);
+        scylla_db
+            .scylla_session
+            .execute_unpaged(
+                &scylla_db.insert_last_processed_block_height_query,
+                checkpoint_row,
+            )
+            .await?;
     }
 
     Ok(())

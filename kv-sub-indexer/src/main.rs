@@ -4,6 +4,8 @@ use crate::scylla_types::{add_kv_rows, FastDataKv, INDEXER_ID, SUFFIX};
 use dotenv::dotenv;
 use fastnear_primitives::near_indexer_primitives::types::BlockHeight;
 use fastnear_primitives::types::ChainId;
+use scylla::statement::prepared::PreparedStatement;
+use scylladb::ScyllaDb;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,6 +17,130 @@ const PROJECT_ID: &str = "kv-sub-indexer";
 const MAX_NUM_KEYS: usize = 256;
 const MAX_KEY_LENGTH: usize = 1024;
 const MAX_VALUE_LENGTH: usize = 1_048_576;
+const MAX_TOTAL_BYTES: usize = 256_000_000;
+const MAX_KV_DATA_SIZE: usize = 4_194_304; // 4MB — defense-in-depth (main-indexer also caps at 4MB)
+const ENTRY_OVERHEAD: usize = 320; // Approximate FastDataKv struct + String metadata per entry
+
+fn parse_kv_entries(fastdata: &scylladb::FastData) -> Vec<FastDataKv> {
+    if fastdata.data.len() > MAX_KV_DATA_SIZE {
+        tracing::warn!(
+            target: PROJECT_ID,
+            "Skipping oversized KV data ({} bytes) for receipt {} action {}",
+            fastdata.data.len(), fastdata.receipt_id, fastdata.action_index
+        );
+        return vec![];
+    }
+    let json_value = match serde_json::from_slice::<serde_json::Value>(&fastdata.data) {
+        Ok(v) => v,
+        Err(_) => {
+            tracing::debug!(target: PROJECT_ID, "Received invalid Key-Value Fastdata");
+            return vec![];
+        }
+    };
+    let json_object = match json_value.as_object() {
+        Some(o) => o,
+        None => {
+            tracing::debug!(target: PROJECT_ID, "Received invalid Key-Value Fastdata");
+            return vec![];
+        }
+    };
+    if json_object.len() > MAX_NUM_KEYS {
+        tracing::warn!(
+            target: PROJECT_ID,
+            "Dropping Key-Value Fastdata with {} keys (max {}) for receipt {} action {}",
+            json_object.len(), MAX_NUM_KEYS, fastdata.receipt_id, fastdata.action_index
+        );
+        return vec![];
+    }
+
+    let order_id = match scylladb::compute_order_id(fastdata) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(target: PROJECT_ID, "Skipping KV entry (data permanently lost): {}", e);
+            return vec![];
+        }
+    };
+    let mut entries = Vec::new();
+    for (key, value) in json_object {
+        if key.len() > MAX_KEY_LENGTH {
+            tracing::debug!(target: PROJECT_ID, "Received Key-Value Fastdata with invalid key length: {}", key.len());
+            continue;
+        }
+        if key.is_empty() || key.chars().any(|c| c.is_control()) {
+            tracing::debug!(target: PROJECT_ID, "Skipping KV key with invalid characters");
+            continue;
+        }
+        let serialized_value = match serde_json::to_string(value) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    target: PROJECT_ID,
+                    "Failed to serialize JSON value for key {}: {:?}. Skipping entry.",
+                    key, e
+                );
+                continue;
+            }
+        };
+        if serialized_value.len() > MAX_VALUE_LENGTH {
+            tracing::debug!(target: PROJECT_ID, "Received Key-Value Fastdata with value too large: {} bytes", serialized_value.len());
+            continue;
+        }
+        entries.push(FastDataKv {
+            receipt_id: fastdata.receipt_id,
+            action_index: fastdata.action_index,
+            tx_hash: fastdata.tx_hash,
+            signer_id: fastdata.signer_id.clone(),
+            predecessor_id: fastdata.predecessor_id.clone(),
+            current_account_id: fastdata.current_account_id.clone(),
+            block_height: fastdata.block_height,
+            block_timestamp: fastdata.block_timestamp,
+            shard_id: fastdata.shard_id,
+            receipt_index: fastdata.receipt_index,
+            order_id,
+            key: key.clone(),
+            value: serialized_value,
+        });
+    }
+    entries
+}
+
+async fn flush_rows(
+    scylladb: &ScyllaDb,
+    kv_insert_query: &PreparedStatement,
+    kv_last_insert_query: &PreparedStatement,
+    kv_accounts_insert_query: &PreparedStatement,
+    rows: &[FastDataKv],
+    checkpoint: Option<BlockHeight>,
+) -> anyhow::Result<()> {
+    let delays = [1, 2, 4];
+    let mut last_error = None;
+
+    for (attempt, &delay_secs) in delays.iter().enumerate() {
+        if attempt > 0 {
+            tracing::warn!(
+                target: PROJECT_ID,
+                "Retrying DB write (attempt {}/{}) after {}s delay",
+                attempt + 1, delays.len(), delay_secs
+            );
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        }
+
+        match add_kv_rows(scylladb, kv_insert_query, kv_last_insert_query, kv_accounts_insert_query, rows, checkpoint).await
+        {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                tracing::error!(
+                    target: PROJECT_ID,
+                    "DB write failed (attempt {}): {:?}",
+                    attempt + 1, e
+                );
+                last_error = Some(e);
+            }
+        }
+    }
+
+    Err(last_error.unwrap())
+}
 
 #[tokio::main]
 async fn main() {
@@ -46,6 +172,10 @@ async fn main() {
     let kv_last_insert_query = scylla_types::prepare_kv_last_insert_query(&scylladb)
         .await
         .expect("Error preparing kv insert query");
+
+    let kv_accounts_insert_query = scylla_types::prepare_kv_accounts_insert_query(&scylladb)
+        .await
+        .expect("Error preparing kv_accounts insert query");
 
     let last_processed_block_height = scylladb
         .get_last_processed_block_height(INDEXER_ID)
@@ -88,163 +218,49 @@ async fn main() {
         is_running.clone(),
     ));
 
-    let mut rows = vec![];
+    let mut rows: Vec<FastDataKv> = vec![];
+    let mut total_bytes: usize = 0;
     while let Some(update) = receiver.recv().await {
         match update {
             SuffixFetcherUpdate::FastData(fastdata) => {
                 tracing::info!(target: PROJECT_ID, "Received fastdata: {} {} {}", fastdata.block_height, fastdata.receipt_id, fastdata.action_index);
-                if let Ok(json_value) = serde_json::from_slice::<serde_json::Value>(&fastdata.data)
-                {
-                    if let Some(json_object) = json_value.as_object() {
-                        if json_object.len() > MAX_NUM_KEYS {
-                            tracing::debug!(target: PROJECT_ID, "Received Key-Value Fastdata with too many keys: {}", json_object.len());
-                            continue;
-                        }
-                        for (key, value) in json_object {
-                            if key.len() > MAX_KEY_LENGTH {
-                                tracing::debug!(target: PROJECT_ID, "Received Key-Value Fastdata with invalid key: {}", key.len());
-                                continue;
-                            }
-                            let serialized_value = match serde_json::to_string(value) {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        target: PROJECT_ID,
-                                        "Failed to serialize JSON value for key {}: {:?}. Skipping entry.",
-                                        key, e
-                                    );
-                                    continue;
-                                }
-                            };
-                            if serialized_value.len() > MAX_VALUE_LENGTH {
-                                tracing::debug!(target: PROJECT_ID, "Received Key-Value Fastdata with value too large: {} bytes", serialized_value.len());
-                                continue;
-                            }
-                            let order_id = scylladb::compute_order_id(&fastdata);
-                            let row = FastDataKv {
-                                receipt_id: fastdata.receipt_id,
-                                action_index: fastdata.action_index,
-                                tx_hash: fastdata.tx_hash,
-                                signer_id: fastdata.signer_id.clone(),
-                                predecessor_id: fastdata.predecessor_id.clone(),
-                                current_account_id: fastdata.current_account_id.clone(),
-                                block_height: fastdata.block_height,
-                                block_timestamp: fastdata.block_timestamp,
-                                shard_id: fastdata.shard_id,
-                                receipt_index: fastdata.receipt_index,
-                                order_id,
 
-                                key: key.clone(),
-                                value: serialized_value,
-                            };
-                            rows.push(row);
-                        }
+                let new_entries = parse_kv_entries(&fastdata);
+                total_bytes +=
+                    new_entries.iter().map(|e| e.key.len() + e.value.len() + ENTRY_OVERHEAD).sum::<usize>();
+                rows.extend(new_entries);
 
-                        // Early flush to prevent unbounded memory growth
-                        if rows.len() >= 10_000 {
-                            tracing::info!(target: PROJECT_ID, "Early flush at {} rows for block {}", rows.len(), fastdata.block_height);
-                            let mut current_rows = vec![];
-                            std::mem::swap(&mut rows, &mut current_rows);
+                if rows.len() >= 10_000 || total_bytes >= MAX_TOTAL_BYTES {
+                    tracing::info!(target: PROJECT_ID, "Early flush at {} rows ({} bytes)", rows.len(), total_bytes);
+                    let current_rows = std::mem::take(&mut rows);
+                    total_bytes = 0;
 
-                            // Retry data write with delays
-                            let delays = [1, 2, 4];
-                            let mut last_error = None;
-
-                            for (attempt, &delay_secs) in delays.iter().enumerate() {
-                                if attempt > 0 {
-                                    tracing::warn!(
-                                        target: PROJECT_ID,
-                                        "Retrying DB write (attempt {}/{}) after {}s delay",
-                                        attempt + 1, delays.len(), delay_secs
-                                    );
-                                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-                                }
-
-                                match add_kv_rows(
-                                    &scylladb,
-                                    &kv_insert_query,
-                                    &kv_last_insert_query,
-                                    current_rows.clone(),
-                                    fastdata.block_height,
-                                ).await {
-                                    Ok(_) => {
-                                        last_error = None;
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            target: PROJECT_ID,
-                                            "DB write failed (attempt {}): {:?}",
-                                            attempt + 1, e
-                                        );
-                                        last_error = Some(e);
-                                    }
-                                }
-                            }
-
-                            if let Some(e) = last_error {
-                                tracing::error!(
-                                    target: PROJECT_ID,
-                                    "Failed to write data after {} retries. Exiting to prevent data loss: {:?}",
-                                    delays.len(), e
-                                );
-                                std::process::exit(1);
-                            }
-                        }
-
-                        continue;
+                    if let Err(e) = flush_rows(
+                        &scylladb, &kv_insert_query, &kv_last_insert_query, &kv_accounts_insert_query,
+                        &current_rows, None,
+                    ).await {
+                        tracing::error!(target: PROJECT_ID,
+                            "Failed to write data after retries. Shutting down to prevent data loss: {:?}", e
+                        );
+                        is_running.store(false, Ordering::SeqCst);
+                        break;
                     }
                 }
-                tracing::debug!(target: PROJECT_ID, "Received invalid Key-Value Fastdata");
             }
             SuffixFetcherUpdate::EndOfRange(block_height) => {
                 tracing::info!(target: PROJECT_ID, "Saving last processed block height {} with {} rows", block_height, rows.len());
-                let mut current_rows = vec![];
-                std::mem::swap(&mut rows, &mut current_rows);
+                let current_rows = std::mem::take(&mut rows);
+                total_bytes = 0;
 
-                // Retry data write with delays
-                let delays = [1, 2, 4];
-                let mut last_error = None;
-
-                for (attempt, &delay_secs) in delays.iter().enumerate() {
-                    if attempt > 0 {
-                        tracing::warn!(
-                            target: PROJECT_ID,
-                            "Retrying DB write (attempt {}/{}) after {}s delay",
-                            attempt + 1, delays.len(), delay_secs
-                        );
-                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-                    }
-
-                    match add_kv_rows(
-                        &scylladb,
-                        &kv_insert_query,
-                        &kv_last_insert_query,
-                        current_rows.clone(),
-                        block_height,
-                    ).await {
-                        Ok(_) => {
-                            last_error = None;
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                target: PROJECT_ID,
-                                "DB write failed (attempt {}): {:?}",
-                                attempt + 1, e
-                            );
-                            last_error = Some(e);
-                        }
-                    }
-                }
-
-                if let Some(e) = last_error {
-                    tracing::error!(
-                        target: PROJECT_ID,
-                        "Failed to write data after {} retries. Exiting to prevent data loss: {:?}",
-                        delays.len(), e
+                if let Err(e) = flush_rows(
+                    &scylladb, &kv_insert_query, &kv_last_insert_query, &kv_accounts_insert_query,
+                    &current_rows, Some(block_height),
+                ).await {
+                    tracing::error!(target: PROJECT_ID,
+                        "Failed to write data after retries. Shutting down to prevent data loss: {:?}", e
                     );
-                    std::process::exit(1);
+                    is_running.store(false, Ordering::SeqCst);
+                    break;
                 }
 
                 if !is_running.load(Ordering::SeqCst) {

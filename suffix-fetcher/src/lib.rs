@@ -75,7 +75,6 @@ impl SuffixFetcher {
     ) {
         let mut from_block_height = config.start_block_height.unwrap_or(0);
         tracing::info!(target: FETCHER, "Starting suffix fetcher with suffix {:?} from {}", config.suffix, from_block_height);
-        let mut last_fastdata_block_height = None;
         while is_running.load(Ordering::SeqCst) {
             let last_block_height = match self
                 .scylladb
@@ -106,9 +105,13 @@ impl SuffixFetcher {
             tracing::info!(target: FETCHER, "Fetching blocks from {} to {}", from_block_height, last_block_height);
 
             let mut range_success = false;
+            let mut range_last_block: Option<BlockHeight> = None; // Tracks actual progress across retries
             let delays = [0, 1, 2, 4]; // 0 for first attempt, then 1s, 2s, 4s for retries
 
             for (attempt, &delay_secs) in delays.iter().enumerate() {
+                // Reset per-attempt state to avoid stale values corrupting retry logic (CRIT-6)
+                let mut last_fastdata_block_height: Option<BlockHeight> = None;
+
                 if delay_secs > 0 {
                     tracing::info!(target: FETCHER, "Retrying range fetch (attempt {}/{}) after {}s delay", attempt, delays.len() - 1, delay_secs);
                     tokio::time::sleep(Duration::from_secs(delay_secs)).await;
@@ -132,7 +135,17 @@ impl SuffixFetcher {
                 };
 
                 let mut had_error = false;
-                while let Some(fastdata) = stream.next().await {
+                const STREAM_ITEM_TIMEOUT: Duration = Duration::from_secs(60);
+                loop {
+                    let fastdata = match tokio::time::timeout(STREAM_ITEM_TIMEOUT, stream.next()).await {
+                        Ok(Some(item)) => item,
+                        Ok(None) => break, // Stream exhausted normally
+                        Err(_) => {
+                            tracing::error!(target: FETCHER, "Stream read timed out after {:?}", STREAM_ITEM_TIMEOUT);
+                            had_error = true;
+                            break;
+                        }
+                    };
                     if !is_running.load(Ordering::SeqCst) {
                         range_success = true;
                         break;
@@ -169,6 +182,11 @@ impl SuffixFetcher {
                     }
                 }
 
+                // Propagate actual progress to outer scope for accurate checkpointing
+                if let Some(h) = last_fastdata_block_height {
+                    range_last_block = Some(h);
+                }
+
                 if !had_error {
                     range_success = true;
                     break;
@@ -176,19 +194,36 @@ impl SuffixFetcher {
             }
 
             if !range_success {
-                tracing::error!(target: FETCHER, "Failed to fetch range after {} retries. Will retry same range.", delays.len() - 1);
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-
-            if sink.send(SuffixFetcherUpdate::EndOfRange(last_block_height))
-                .await
-                .is_err() {
-                tracing::warn!(target: FETCHER, "Channel closed, stopping");
+                tracing::error!(
+                    target: FETCHER,
+                    "Failed to fetch range [{}, {}] after {} retries. Halting to prevent data loss.",
+                    from_block_height, last_block_height, delays.len() - 1
+                );
+                is_running.store(false, Ordering::SeqCst);
                 break;
             }
-            from_block_height = last_block_height + 1;
-            last_fastdata_block_height = None;
+
+            // Checkpoint based on actual progress
+            if let Some(checkpoint_height) = range_last_block {
+                // Rows were processed — checkpoint at last processed block
+                if sink.send(SuffixFetcherUpdate::EndOfRange(checkpoint_height))
+                    .await
+                    .is_err() {
+                    tracing::warn!(target: FETCHER, "Channel closed, stopping");
+                    break;
+                }
+                from_block_height = checkpoint_height + 1;
+            } else if is_running.load(Ordering::SeqCst) {
+                // Empty range (no rows existed) and not interrupted — safe to advance
+                if sink.send(SuffixFetcherUpdate::EndOfRange(last_block_height))
+                    .await
+                    .is_err() {
+                    tracing::warn!(target: FETCHER, "Channel closed, stopping");
+                    break;
+                }
+                from_block_height = last_block_height + 1;
+            }
+            // If !is_running && no rows processed: Ctrl-C before progress — don't advance checkpoint
         }
         tracing::info!(target: FETCHER, "Stopped suffix fetcher");
     }

@@ -47,8 +47,13 @@ fn is_valid_relative_path(path: &str) -> bool {
         || path.starts_with('/')
         || path.starts_with('\\')
         || path.contains('\0')
-        || path.split('/').any(|c| c == "..")
-        || path.split('\\').any(|c| c == "..")
+        || path.ends_with('/')
+        || path.ends_with('\\')
+        || path.split('/').any(|c| c.is_empty() || c == "." || c == "..")
+        || path.split('\\').any(|c| c.is_empty() || c == "." || c == "..")
+        || path.contains('%') // Block URL-encoded traversal (e.g. %2e%2e)
+        || !path.is_ascii() // Block non-ASCII/Unicode bypass characters
+        || path.chars().any(|c| c.is_ascii_control()) // Block control characters
     {
         return false;
     }
@@ -66,10 +71,17 @@ impl PartialFastfs {
         if self.full_size == 0 || self.full_size > MAX_FULL_SIZE {
             return false;
         }
-        if self.mime_type.is_empty() || self.mime_type.len() > MAX_MIME_TYPE_LENGTH {
+        if self.mime_type.is_empty()
+            || self.mime_type.len() > MAX_MIME_TYPE_LENGTH
+            || !self.mime_type.is_ascii()
+            || self.mime_type.chars().any(|c| c.is_ascii_control())
+        {
             return false;
         }
         if self.content_chunk.len() > OFFSET_ALIGNMENT as usize {
+            return false;
+        }
+        if self.offset + self.content_chunk.len() as u32 > self.full_size {
             return false;
         }
         if self.nonce == 0 || self.nonce > i32::MAX as u32 {
@@ -85,7 +97,11 @@ impl SimpleFastfs {
             return false;
         }
         if let Some(content) = &self.content {
-            if content.mime_type.is_empty() || content.mime_type.len() > MAX_MIME_TYPE_LENGTH {
+            if content.mime_type.is_empty()
+                || content.mime_type.len() > MAX_MIME_TYPE_LENGTH
+                || !content.mime_type.is_ascii()
+                || content.mime_type.chars().any(|c| c.is_ascii_control())
+            {
                 return false;
             }
             if content.content.len() > MAX_FULL_SIZE as usize {

@@ -7,7 +7,7 @@ High-performance blockchain data pipeline for the NEAR FastData protocol. Captur
 ```
 NEAR Blockchain
       ↓
-NEAR Lake (AWS S3)
+fastnear neardata API (HTTP)
       ↓
 ┌─────────────────────────┐
 │    main-indexer         │ → blobs table (all FastData transactions)
@@ -38,7 +38,7 @@ Get FastData Indexer running in 5 minutes.
 
 - **Rust:** Install with `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - **ScyllaDB:** Access to a ScyllaDB cluster (local or cloud)
-- **AWS Credentials:** For NEAR Lake S3 access
+- **Fastnear API:** Optional auth bearer token for neardata API
 
 ### Setup
 
@@ -118,7 +118,7 @@ Core database abstraction providing connection management and schema definitions
 **Consistency Levels:**
 
 - Writes: `LocalQuorum` (durable)
-- Reads: `LocalOne` (fast)
+- Reads: `LocalQuorum` (consistent)
 
 **Key Types:**
 
@@ -170,7 +170,7 @@ while let Some(update) = receiver.recv().await {
 
 #### main-indexer
 
-Reads blocks from NEAR Lake and stores all `__fastdata_*` transactions in the `blobs` table.
+Reads blocks from the fastnear neardata API and stores all `__fastdata_*` transactions in the `blobs` table.
 
 **Supported Protocols:**
 
@@ -181,7 +181,7 @@ Reads blocks from NEAR Lake and stores all `__fastdata_*` transactions in the `b
 
 **Processing:**
 
-1. Fetches blocks from NEAR Lake using `fastnear-neardata-fetcher`
+1. Fetches blocks from the fastnear neardata API using `fastnear-neardata-fetcher`
 2. Scans all function calls for methods starting with `__fastdata_`
 3. Extracts suffix (method name without prefix) and arguments as blob
 4. Stores in `blobs` table with the actual suffix (kv, fastfs, raw, etc.)
@@ -474,15 +474,12 @@ SCYLLA_SSL_CA=<path/to/ca.crt>       # TLS CA certificate
 SCYLLA_SSL_CERT=<path/to/client.crt> # mTLS client certificate
 SCYLLA_SSL_KEY=<path/to/client.key>  # mTLS client private key
 
-# AWS Configuration (for NEAR Lake access)
-AWS_ACCESS_KEY_ID=<key>              # AWS access key
-AWS_SECRET_ACCESS_KEY=<secret>       # AWS secret key
-AWS_DEFAULT_REGION=eu-central-1      # NEAR Lake region
+# Fastnear neardata API
+FASTNEAR_AUTH_BEARER_TOKEN=<token>   # Optional auth for neardata API
 
 # Optional: Runtime Configuration
 NUM_THREADS=8                         # Thread pool size for main-indexer
 BLOCK_UPDATE_INTERVAL_MS=5000        # Checkpoint interval (ms)
-FASTNEAR_AUTH_BEARER_TOKEN=<token>   # Optional auth for NEAR Lake API
 ```
 
 **Security Note:** Never commit `.env` to version control. It's already in `.gitignore`.
@@ -509,7 +506,7 @@ SCYLLA_SSL_KEY=/path/to/client-key.pem
 
 - **Rust:** 1.86.0 or higher (nightly recommended)
 - **ScyllaDB:** 5.0+ cluster with network access
-- **AWS Credentials:** For NEAR Lake S3 bucket access
+- **Fastnear API:** Optional auth bearer token for neardata API
 - **Git:** For version control
 
 ### Build
@@ -846,7 +843,7 @@ cargo build --release --bin my-sub-indexer
 ```
 1. NEAR Blockchain generates transactions with __fastdata_* methods
    ↓
-2. NEAR Lake writes blocks to AWS S3
+2. fastnear neardata API serves block data over HTTP
    ↓
 3. main-indexer fetches blocks via fastnear-neardata-fetcher (8 parallel threads)
    ↓
@@ -932,7 +929,7 @@ cargo build --release --bin my-sub-indexer
 **main-indexer not starting:**
 
 - Verify `START_BLOCK_HEIGHT` is valid for the chain
-- Check AWS credentials and region
+- Check Fastnear API authentication (FASTNEAR_AUTH_BEARER_TOKEN if configured)
 - Ensure ScyllaDB is reachable and credentials are correct
 
 **Sub-indexer lagging:**
@@ -996,5 +993,5 @@ https://github.com/fastnear/libs
 
 - NEAR Protocol: https://near.org
 - ScyllaDB: https://www.scylladb.com
-- NEAR Lake: https://github.com/near/near-lake-framework-rs
+- Fastnear neardata: https://github.com/fastnear/fastnear-neardata-fetcher
 - Fastnear: https://fastnear.com

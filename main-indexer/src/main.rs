@@ -13,6 +13,9 @@ use tokio::sync::mpsc;
 
 const FASTDATA_PREFIX: &str = "__fastdata_";
 const PROJECT_ID: &str = "fastdata-indexer";
+const MAX_DATA_SIZE: usize = 4_194_304; // 4MB — matches NEAR protocol max
+const MAX_ENTRIES_PER_BLOCK: usize = 100_000;
+const MAX_DATA_BYTES_PER_BLOCK: usize = 512 * 1024 * 1024; // 512MB total payload cap per block
 
 #[tokio::main]
 async fn main() {
@@ -51,7 +54,8 @@ async fn main() {
     let num_threads = env::var("NUM_THREADS")
         .ok()
         .map(|num_threads| num_threads.parse().expect("Invalid number of threads"))
-        .unwrap_or(8);
+        .unwrap_or(8u64)
+        .max(1);
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -124,14 +128,32 @@ async fn main() {
     ));
 
     let mut last_block_update = std::time::SystemTime::now();
+    let mut expected_block_height: Option<BlockHeight> = None;
+    let mut consecutive_checkpoint_failures: u32 = 0;
+    const MAX_CONSECUTIVE_CHECKPOINT_FAILURES: u32 = 5;
     while let Some(block) = receiver.recv().await {
         let block_height = block.block.header.height;
         let block_timestamp = block.block.header.timestamp;
+
+        if let Some(expected) = expected_block_height {
+            if block_height != expected {
+                tracing::error!(
+                    target: PROJECT_ID,
+                    "BLOCK GAP DETECTED: expected block {}, got {}. {} blocks missing! Halting to prevent data loss.",
+                    expected, block_height, block_height.saturating_sub(expected)
+                );
+                is_running.store(false, Ordering::SeqCst);
+                break;
+            }
+        }
+        expected_block_height = Some(block_height + 1);
+
         tracing::info!(target: PROJECT_ID, "Received block: {}", block_height);
 
         let mut data = vec![];
+        let mut data_bytes: usize = 0;
 
-        for shard in block.shards {
+        'shards: for shard in block.shards {
             for (receipt_index, reo) in shard.receipt_execution_outcomes.into_iter().enumerate() {
                 let receipt = reo.receipt;
                 let receipt_id = receipt.receipt_id;
@@ -148,6 +170,35 @@ async fn main() {
                         } = action
                         {
                             if let Some(suffix) = method_name.strip_prefix(FASTDATA_PREFIX) {
+                                if suffix.is_empty()
+                                    || suffix == UNIVERSAL_SUFFIX
+                                    || suffix.len() > 64
+                                    || !suffix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                                {
+                                    tracing::warn!(
+                                        target: PROJECT_ID,
+                                        "Skipping invalid suffix {:?} for receipt {} action {}",
+                                        suffix, receipt_id, action_index
+                                    );
+                                    continue;
+                                }
+                                if args.len() > MAX_DATA_SIZE {
+                                    tracing::warn!(
+                                        target: PROJECT_ID,
+                                        "Skipping oversized fastdata ({} bytes) for receipt {} action {}",
+                                        args.len(), receipt_id, action_index
+                                    );
+                                    continue;
+                                }
+                                if data.len() >= MAX_ENTRIES_PER_BLOCK || data_bytes >= MAX_DATA_BYTES_PER_BLOCK {
+                                    tracing::warn!(
+                                        target: PROJECT_ID,
+                                        "Block {} truncated: {} entries, {} bytes",
+                                        block_height, data.len(), data_bytes
+                                    );
+                                    break 'shards;
+                                }
+                                data_bytes += args.len();
                                 data.push(FastData {
                                     receipt_id,
                                     action_index: action_index as _,
@@ -205,10 +256,11 @@ async fn main() {
             if !success {
                 tracing::error!(
                     target: PROJECT_ID,
-                    "Failed to insert data after {} retries. Exiting to prevent data loss.",
+                    "Failed to insert data after {} retries. Shutting down to prevent data loss.",
                     delays.len() - 1
                 );
-                std::process::exit(1);
+                is_running.store(false, Ordering::SeqCst);
+                break;
             }
 
             need_to_save_last_processed_block_height = true;
@@ -253,13 +305,22 @@ async fn main() {
 
             if checkpoint_success {
                 last_block_update = current_time;
+                consecutive_checkpoint_failures = 0;
             } else {
+                consecutive_checkpoint_failures += 1;
+                last_block_update = current_time; // Prevent retry storm on every subsequent block
                 tracing::error!(
                     target: PROJECT_ID,
-                    "Failed to save checkpoint after {} retries. Will reprocess from last checkpoint on restart.",
-                    checkpoint_delays.len()
+                    "Checkpoint failed ({}/{} consecutive). Will reprocess from last checkpoint on restart.",
+                    consecutive_checkpoint_failures, MAX_CONSECUTIVE_CHECKPOINT_FAILURES
                 );
-                // Continue - reprocessing is safe due to idempotent DB inserts
+                if consecutive_checkpoint_failures >= MAX_CONSECUTIVE_CHECKPOINT_FAILURES {
+                    tracing::error!(
+                        target: PROJECT_ID,
+                        "Too many consecutive checkpoint failures. Shutting down."
+                    );
+                    is_running.store(false, Ordering::SeqCst);
+                }
             }
         }
 

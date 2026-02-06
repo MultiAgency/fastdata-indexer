@@ -6,11 +6,12 @@ pub use crate::types::{FastData, UNIVERSAL_SUFFIX};
 pub use crate::utils::*;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
+use scylla::errors::SingleRowError;
 use scylla::statement::prepared::PreparedStatement;
 
-use crate::types::FastDataRow;
+use crate::types::{FastDataRow, BLOCK_HEIGHT_BUCKET_SIZE};
 use fastnear_primitives::types::ChainId;
-use futures::Stream;
+use futures::{stream, Stream};
 use rustls::pki_types::pem::PemObject;
 use rustls::{ClientConfig, RootCertStore};
 use std::env;
@@ -106,7 +107,6 @@ impl ScyllaDb {
         scylla_session: Session,
         create_tables: bool,
     ) -> anyhow::Result<Self> {
-        // Self::create_keyspace(chain_id, &scylla_session).await?;
         scylla_session
             .use_keyspace(format!("fastdata_{chain_id}"), false)
             .await?;
@@ -117,14 +117,14 @@ impl ScyllaDb {
         Ok(Self {
             insert_fastdata_query: Self::prepare_query(
                 &scylla_session,
-                "INSERT INTO blobs (receipt_id, action_index, suffix, data, tx_hash, signer_id, predecessor_id, current_account_id, block_height, block_timestamp, shard_id, receipt_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO blobs (receipt_id, action_index, suffix, block_height_bucket, data, tx_hash, signer_id, predecessor_id, current_account_id, block_height, block_timestamp, shard_id, receipt_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 scylla::frame::types::Consistency::LocalQuorum,
             )
             .await?,
             select_fastdata_query_by_suffix_from: Self::prepare_query(
                 &scylla_session,
-                "SELECT * FROM blobs WHERE suffix = ? AND block_height >= ? AND block_height <= ?",
-                scylla::frame::types::Consistency::LocalOne,
+                "SELECT * FROM blobs WHERE suffix = ? AND block_height_bucket = ? AND block_height >= ? AND block_height <= ?",
+                scylla::frame::types::Consistency::LocalQuorum,
             ).await?,
             insert_last_processed_block_height_query: Self::prepare_query(
                 &scylla_session,
@@ -134,7 +134,7 @@ impl ScyllaDb {
             select_last_processed_block_height_query: Self::prepare_query(
                 &scylla_session,
                 "SELECT last_processed_block_height FROM meta WHERE suffix = ? LIMIT 1",
-                scylla::frame::types::Consistency::LocalOne,
+                scylla::frame::types::Consistency::LocalQuorum,
             )
             .await?,
             scylla_session,
@@ -151,32 +151,13 @@ impl ScyllaDb {
         Ok(scylla_db_session.prepare(query).await?)
     }
 
-    #[allow(unused)]
-    pub async fn create_keyspace(
-        chain_id: ChainId,
-        scylla_session: &Session,
-    ) -> anyhow::Result<()> {
-        scylla_session
-            .query_unpaged(
-                format!(
-                    "CREATE KEYSPACE IF NOT EXISTS fastdata_{chain_id}
-                    WITH REPLICATION = {{
-                        'class': 'NetworkTopologyStrategy',
-                        'dc1': 3
-                    }} AND TABLETS = {{'enabled': true}};"
-                ),
-                &[],
-            )
-            .await?;
-        Ok(())
-    }
-
     pub async fn create_tables(scylla_session: &Session) -> anyhow::Result<()> {
         let queries = [
             "CREATE TABLE IF NOT EXISTS blobs (
                 receipt_id text,
                 action_index int,
                 suffix text,
+                block_height_bucket bigint,
                 data blob,
                 tx_hash text,
                 signer_id text,
@@ -186,10 +167,10 @@ impl ScyllaDb {
                 block_timestamp bigint,
                 shard_id int,
                 receipt_index int,
-                PRIMARY KEY ((suffix), block_height, shard_id, receipt_index, action_index, receipt_id)
+                PRIMARY KEY ((suffix, block_height_bucket), block_height, shard_id, receipt_index, action_index, receipt_id)
             )",
-            "CREATE INDEX IF NOT EXISTS idx_tx_hash ON blobs (tx_hash)",
-            "CREATE INDEX IF NOT EXISTS idx_receipt_id ON blobs (receipt_id)",
+            // Secondary indexes on high-cardinality columns removed (ScyllaDB anti-pattern).
+            // Use dedicated lookup tables if tx_hash/receipt_id queries are needed.
             "CREATE TABLE IF NOT EXISTS meta (
                 suffix text PRIMARY KEY,
                 last_processed_block_height bigint
@@ -210,30 +191,46 @@ impl ScyllaDb {
     }
 
     /// Fetches all fast data for a given suffix and block height range (inclusive both ends).
+    /// Queries each block_height_bucket partition separately and chains results in order.
     pub async fn get_suffix_data(
         &self,
         suffix: &str,
         from_block_height: u64,
         to_block_height: u64,
     ) -> anyhow::Result<impl Stream<Item = anyhow::Result<FastData>>> {
-        let rows_stream = self
-            .scylla_session
-            .execute_iter(
-                self.select_fastdata_query_by_suffix_from.clone(),
-                (
-                    suffix.to_string(),
-                    from_block_height as i64,
-                    to_block_height as i64,
-                ),
-            )
-            .await?
-            .rows_stream::<FastDataRow>()?;
-        // Making an iterator from the stream
-        Ok(rows_stream.map(|row| {
-            match row {
-                Ok(row) => row.try_into(),
-                Err(e) => Err(anyhow::anyhow!("Database error: {:?}", e)),
-            }
+        let from_bucket = from_block_height / BLOCK_HEIGHT_BUCKET_SIZE;
+        let to_bucket = to_block_height / BLOCK_HEIGHT_BUCKET_SIZE;
+
+        const MAX_BUCKET_SPAN: u64 = 1_000; // 10M blocks max per query
+        if to_bucket.saturating_sub(from_bucket) > MAX_BUCKET_SPAN {
+            return Err(anyhow::anyhow!(
+                "Block range too large: {} buckets (max {}). from={}, to={}",
+                to_bucket - from_bucket, MAX_BUCKET_SPAN, from_block_height, to_block_height
+            ));
+        }
+
+        let mut bucket_streams = Vec::new();
+        for bucket in from_bucket..=to_bucket {
+            let rows_stream = self
+                .scylla_session
+                .execute_iter(
+                    self.select_fastdata_query_by_suffix_from.clone(),
+                    (
+                        suffix.to_string(),
+                        bucket as i64,
+                        from_block_height as i64,
+                        to_block_height as i64,
+                    ),
+                )
+                .await?
+                .rows_stream::<FastDataRow>()?;
+            bucket_streams.push(rows_stream);
+        }
+
+        // Chain bucket streams sequentially to maintain block_height ordering
+        Ok(stream::iter(bucket_streams).flatten().map(|row| match row {
+            Ok(row) => row.try_into(),
+            Err(e) => Err(anyhow::anyhow!("Database error: {:?}", e)),
         }))
     }
 
@@ -263,6 +260,14 @@ impl ScyllaDb {
             )
             .await?
             .into_rows_result()?;
-        Ok(rows.single_row::<(i64,)>().ok().map(|(v,)| v as _))
+        match rows.single_row::<(i64,)>() {
+            Ok((v,)) => {
+                let height = u64::try_from(v)
+                    .map_err(|_| anyhow::anyhow!("Negative checkpoint in DB: {}", v))?;
+                Ok(Some(height))
+            }
+            Err(SingleRowError::UnexpectedRowCount(0)) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("Checkpoint read error: {:?}", e)),
+        }
     }
 }

@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 const PROJECT_ID: &str = "fastfs-sub-indexer";
 const SUFFIX: &str = "fastfs";
 const INDEXER_ID: &str = "fastfs_v2";
+const MAX_FASTFS_DATA_SIZE: usize = 33_555_456; // 32MB + 1KB overhead
 
 #[tokio::main]
 async fn main() {
@@ -88,21 +89,37 @@ async fn main() {
         is_running.clone(),
     ));
 
+    let mut consecutive_checkpoint_failures: u32 = 0;
+    const MAX_CONSECUTIVE_CHECKPOINT_FAILURES: u32 = 5;
     while let Some(update) = receiver.recv().await {
         match update {
             SuffixFetcherUpdate::FastData(fastdata) => {
                 tracing::info!(target: PROJECT_ID, "Received fastdata: {} {} {}", fastdata.block_height, fastdata.receipt_id, fastdata.action_index);
+                if fastdata.data.len() > MAX_FASTFS_DATA_SIZE {
+                    tracing::warn!(
+                        target: PROJECT_ID,
+                        "Skipping oversized fastfs data ({} bytes) for receipt {} action {}",
+                        fastdata.data.len(), fastdata.receipt_id, fastdata.action_index
+                    );
+                    continue;
+                }
                 let value: FastfsData = match borsh::from_slice(&fastdata.data) {
                     Ok(v) => v,
-                    Err(_) => {
-                        tracing::debug!(target: PROJECT_ID, "Failed to deserialize borsh data for receipt {} action {}, skipping", fastdata.receipt_id, fastdata.action_index);
+                    Err(e) => {
+                        tracing::warn!(target: PROJECT_ID, "Failed to deserialize borsh data for receipt {} action {}: {:?}, skipping", fastdata.receipt_id, fastdata.action_index, e);
                         continue;
                     }
                 };
                 {
                     match value {
                         FastfsData::Simple(simple_fastfs) => {
-                            if simple_fastfs.is_valid() {
+                            if !simple_fastfs.is_valid() {
+                                tracing::warn!(
+                                    target: PROJECT_ID,
+                                    "Invalid SimpleFastfs data for receipt {} action {}, skipping",
+                                    fastdata.receipt_id, fastdata.action_index
+                                );
+                            } else {
                                 let (mime_type, content) = simple_fastfs
                                     .content
                                     .map(|c| (Some(c.mime_type), Some(c.content)))
@@ -162,15 +179,22 @@ async fn main() {
                                 if let Some(e) = last_error {
                                     tracing::error!(
                                         target: PROJECT_ID,
-                                        "Failed to write FastFS data after {} retries. Exiting to prevent data loss: {:?}",
+                                        "Failed to write FastFS data after {} retries. Shutting down to prevent data loss: {:?}",
                                         delays.len(), e
                                     );
-                                    std::process::exit(1);
+                                    is_running.store(false, Ordering::SeqCst);
+                                    break;
                                 }
                             }
                         }
                         FastfsData::Partial(partial_fs) => {
-                            if partial_fs.is_valid() {
+                            if !partial_fs.is_valid() {
+                                tracing::warn!(
+                                    target: PROJECT_ID,
+                                    "Invalid PartialFastfs data for receipt {} action {}, skipping",
+                                    fastdata.receipt_id, fastdata.action_index
+                                );
+                            } else {
                                 let fastfs_fastdata = FastfsFastData {
                                     receipt_id: fastdata.receipt_id,
                                     action_index: fastdata.action_index,
@@ -224,10 +248,11 @@ async fn main() {
                                 if let Some(e) = last_error {
                                     tracing::error!(
                                         target: PROJECT_ID,
-                                        "Failed to write FastFS partial data after {} retries. Exiting to prevent data loss: {:?}",
+                                        "Failed to write FastFS partial data after {} retries. Shutting down to prevent data loss: {:?}",
                                         delays.len(), e
                                     );
-                                    std::process::exit(1);
+                                    is_running.store(false, Ordering::SeqCst);
+                                    break;
                                 }
                             }
                         }
@@ -266,13 +291,22 @@ async fn main() {
                     }
                 }
 
-                if !checkpoint_success {
+                if checkpoint_success {
+                    consecutive_checkpoint_failures = 0;
+                } else {
+                    consecutive_checkpoint_failures += 1;
                     tracing::error!(
                         target: PROJECT_ID,
-                        "Failed to save checkpoint after {} retries. Will reprocess from last checkpoint on restart.",
-                        checkpoint_delays.len()
+                        "Checkpoint failed ({}/{} consecutive). Will reprocess from last checkpoint on restart.",
+                        consecutive_checkpoint_failures, MAX_CONSECUTIVE_CHECKPOINT_FAILURES
                     );
-                    // Continue - reprocessing is safe due to idempotent DB inserts
+                    if consecutive_checkpoint_failures >= MAX_CONSECUTIVE_CHECKPOINT_FAILURES {
+                        tracing::error!(
+                            target: PROJECT_ID,
+                            "Too many consecutive checkpoint failures. Shutting down."
+                        );
+                        is_running.store(false, Ordering::SeqCst);
+                    }
                 }
 
                 if !is_running.load(Ordering::SeqCst) {
