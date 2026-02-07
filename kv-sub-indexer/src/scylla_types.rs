@@ -263,11 +263,9 @@ pub(crate) async fn prepare_kv_reverse_insert_query(
 }
 
 /// Auto-detects a graph edge from a KV key.
-/// Key format: `{source}/{...edge_type...}/{target}`
-/// An edge is detected when:
-/// - At least 3 segments separated by `/`
-/// - First segment (source) equals `predecessor_id`
-/// - Last segment = target, middle segments joined by `/` = edge_type
+/// Key must have at least 2 `/`-separated segments.
+/// Last segment = target, all preceding segments joined by `/` = edge_type.
+/// Source is always `predecessor_id` (not derived from the key).
 pub(crate) fn extract_edge(key: &str, predecessor_id: &str) -> Option<(String, String, String)> {
     let key = key.trim_start_matches('/');
     let segments: Vec<&str> = key.split('/').collect();

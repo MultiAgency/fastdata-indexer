@@ -28,6 +28,8 @@ s_kv, s_kv_last    s_fastfs_v2
 mv_kv_key          (file chunks)
 mv_kv_cur_key
 kv_accounts
+kv_reverse
+kv_edges
 ```
 
 ## Quick Start
@@ -87,7 +89,7 @@ cargo build --release
 **6. Verify it's working:**
 
 ```bash
-# Check logs for "Processing block" messages
+# Check logs for "Received block" messages
 # Query ScyllaDB:
 cqlsh -u scylla -p <password> <host>
 > SELECT * FROM fastdata_mainnet.meta;
@@ -108,7 +110,6 @@ Core database abstraction providing connection management and schema definitions
 **Features:**
 
 - TLS/mTLS authentication support
-- Connection pooling with configurable retry policies
 - Schema creation and migration
 - Prepared statement management
 - Keyspace: `fastdata_{CHAIN_ID}` (separate per chain)
@@ -118,7 +119,7 @@ Core database abstraction providing connection management and schema definitions
 **Consistency Levels:**
 
 - Writes: `LocalQuorum` (durable)
-- Reads: `LocalQuorum` (consistent)
+- Reads: `LocalOne` for blobs, `LocalQuorum` for checkpoints
 
 **Key Types:**
 
@@ -202,16 +203,18 @@ Processes KV entries from `blobs` table into dedicated KV tables with optimized 
 - Fetches data with suffix "kv" via `SuffixFetcher`
 - Parses JSON blobs as key-value objects
 - Validates keys (max 1024 chars) and limits to 256 keys per blob
-- Deduplicates by key within each block
+- Deduplicates by (predecessor, account, key) within each flush batch
 - Stores each key-value pair as separate rows
 
 **Output Tables:**
 
 - `s_kv` - All KV entries with full history
 - `s_kv_last` - Latest value per key (for fast lookups)
+- `kv_accounts` - Lookup table for accounts by contract
+- `kv_reverse` - Latest KV repartitioned by (contract, key) for cursor pagination over predecessors
+- `kv_edges` - Auto-detected graph edges from KV keys with `/`-separated segments
 - `mv_kv_key` - Materialized view indexed by key
 - `mv_kv_cur_key` - Materialized view for reverse lookups by account
-- `kv_accounts` - Lookup table for accounts by contract
 
 **Indexer ID:** `kv-1`
 
@@ -243,8 +246,8 @@ Processes FastFS file uploads into file storage tables supporting chunked upload
 
 **File Constraints:**
 
-- Max relative path: 1024 bytes
-- Max MIME type: 256 bytes
+- Max relative path: 1024 characters (ASCII only)
+- Max MIME type: 256 characters (ASCII only)
 - Chunk size: up to 1MB
 - Total file size: up to 32MB
 - Offset alignment: 1MB (required for partial uploads)
@@ -392,6 +395,59 @@ Example query to find all accounts that wrote to a contract:
 SELECT * FROM kv_accounts WHERE current_account_id = 'mycontract.near';
 ```
 
+**kv_reverse** - Latest KV values repartitioned by (contract, key) for cursor pagination over predecessors:
+
+```sql
+CREATE TABLE IF NOT EXISTS kv_reverse (
+    current_account_id text,
+    key text,
+    predecessor_id text,
+    receipt_id text,
+    action_index int,
+    tx_hash text,
+    signer_id text,
+    block_height bigint,
+    block_timestamp bigint,
+    shard_id int,
+    receipt_index int,
+    order_id bigint,
+    value text,
+    PRIMARY KEY ((current_account_id, key), predecessor_id)
+);
+```
+
+Example query to find all predecessors that set a key on a contract:
+```sql
+SELECT * FROM kv_reverse
+WHERE current_account_id = 'app.near' AND key = 'settings';
+```
+
+**kv_edges** - Auto-detected graph edges from KV keys with `/`-separated segments:
+
+```sql
+CREATE TABLE IF NOT EXISTS kv_edges (
+    edge_type text,
+    target text,
+    source text,
+    current_account_id text,
+    block_height bigint,
+    block_timestamp bigint,
+    order_id bigint,
+    value text,
+    PRIMARY KEY ((edge_type, target), source)
+);
+```
+
+Edge detection: keys with 2+ `/`-separated segments produce an edge where `edge_type` = all segments except last, `target` = last segment, and `source` = `predecessor_id`. Uses `USING TIMESTAMP` for deterministic last-write-wins.
+
+Example: key `"graph/follow/bob.near"` from predecessor `"alice.near"` produces edge_type=`"graph/follow"`, source=`"alice.near"`, target=`"bob.near"`.
+
+```sql
+-- Find all followers of bob.near
+SELECT source FROM kv_edges
+WHERE edge_type = 'graph/follow' AND target = 'bob.near';
+```
+
 ### s_fastfs_v2 (fastfs-sub-indexer output)
 
 Stores file chunks with metadata for FastFS file system.
@@ -462,16 +518,16 @@ SCYLLA_USERNAME=scylla               # Database username
 SCYLLA_PASSWORD=<password>           # Database password
 
 # Optional: TLS/mTLS Configuration
-SCYLLA_SSL_CA=<path/to/ca.crt>       # TLS CA certificate
-SCYLLA_SSL_CERT=<path/to/client.crt> # mTLS client certificate
-SCYLLA_SSL_KEY=<path/to/client.key>  # mTLS client private key
+# SCYLLA_SSL_CA=<path/to/ca.crt>       # TLS CA certificate
+# SCYLLA_SSL_CERT=<path/to/client.crt> # mTLS client certificate
+# SCYLLA_SSL_KEY=<path/to/client.key>  # mTLS client private key
 
-# Fastnear neardata API
-FASTNEAR_AUTH_BEARER_TOKEN=<token>   # Optional auth for neardata API
+# Optional: Fastnear neardata API
+# FASTNEAR_AUTH_BEARER_TOKEN=<token>   # Auth for neardata API
 
 # Optional: Runtime Configuration
-NUM_THREADS=8                         # Thread pool size for main-indexer
-BLOCK_UPDATE_INTERVAL_MS=5000        # Checkpoint interval (ms)
+# NUM_THREADS=8                         # Thread pool size for main-indexer (default: 8)
+# BLOCK_UPDATE_INTERVAL_MS=5000        # Checkpoint interval in ms (default: 5000)
 ```
 
 **Security Note:** Never commit `.env` to version control. It's already in `.gitignore`.
@@ -578,7 +634,6 @@ docker run --env-file .env -d --name fastfs-sub-indexer fastdata-fastfs-sub-inde
 **Docker Compose (recommended):**
 
 ```yaml
-version: "3.8"
 services:
   main-indexer:
     image: fastdata-main-indexer:latest
@@ -651,10 +706,8 @@ JSON-based key-value storage with automatic deduplication.
 
 **Validation:**
 
-- Max 4MB total data size per transaction
 - Max 256 keys per transaction
 - Max 1024 characters per key
-- Max 1MB per value
 - Keys must be non-empty, valid UTF-8, with no control characters
 - Deduplication: One value per key per block (if duplicate keys exist in same block, highest order_id wins)
 
@@ -685,6 +738,16 @@ WHERE predecessor_id = 'user.near'
 AND current_account_id = 'app.near'
 AND key = 'settings'
 ORDER BY block_height DESC;
+
+-- Find all predecessors who set a key on a contract (via kv_reverse)
+SELECT * FROM kv_reverse
+WHERE current_account_id = 'app.near'
+AND key = 'settings';
+
+-- Find all followers of an account (via kv_edges)
+SELECT source FROM kv_edges
+WHERE edge_type = 'graph/follow'
+AND target = 'bob.near';
 ```
 
 ### FastFS Standard (suffix: "fastfs")
@@ -695,9 +758,13 @@ Borsh-encoded file storage supporting complete and chunked uploads.
 
 ```rust
 SimpleFastfs {
-    relative_path: String,      // Max 1024 bytes
-    mime_type: Option<String>,  // Max 256 bytes
-    content: Vec<u8>,           // File content
+    relative_path: String,                // Max 1024 chars, ASCII only
+    content: Option<FastfsFileContent>,   // None = deletion
+}
+
+FastfsFileContent {
+    mime_type: String,   // Required, max 256 chars, ASCII only
+    content: Vec<u8>,    // File content (up to 32MB)
 }
 ```
 
@@ -705,9 +772,9 @@ SimpleFastfs {
 
 ```rust
 PartialFastfs {
-    relative_path: String,      // Max 1024 bytes
+    relative_path: String,      // Max 1024 chars, ASCII only
     offset: u32,                // Must be 1MB aligned
-    mime_type: String,          // Required, max 256 bytes, ASCII only
+    mime_type: String,          // Required, max 256 chars, ASCII only
     content_chunk: Vec<u8>,     // Chunk content (up to 1MB)
     full_size: u32,             // Total file size (up to 32MB)
     nonce: u32,                 // Upload session ID (1..=i32::MAX)
@@ -716,8 +783,8 @@ PartialFastfs {
 
 **Validation:**
 
-- Paths must be valid UTF-8 and ≤1024 bytes
-- MIME types must be non-empty and ≤256 bytes
+- Paths must be ASCII-only and ≤1024 characters
+- MIME types must be non-empty, ASCII-only, and ≤256 characters
 - Chunked uploads: offsets must be 1MB (1048576 bytes) aligned
 - Total file size ≤32MB (33554432 bytes)
 - Chunks uploaded out of order are supported (assembled by offset)
@@ -814,8 +881,8 @@ while let Some(update) = receiver.recv().await {
 
 ```rust
 // In scylla_types.rs
-pub async fn create_my_table(session: &Arc<Session>) -> Result<()> {
-    session.query(
+pub async fn create_my_table(scylla_db: &ScyllaDb) -> anyhow::Result<()> {
+    scylla_db.scylla_session.query_unpaged(
         "CREATE TABLE IF NOT EXISTS s_my_data (...)",
         &[]
     ).await?;
@@ -981,7 +1048,7 @@ at your option.
 
 ## Repository
 
-https://github.com/fastnear/libs
+https://github.com/fastnear/fastdata-indexer
 
 ## Links
 

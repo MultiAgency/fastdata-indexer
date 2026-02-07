@@ -35,8 +35,7 @@ pub struct SuffixFetcherConfig {
     pub suffix: String,
 
     /// The optional starting block height for the fetcher. If provided, the fetcher
-    /// will begin retrieving data from this block height. If `None`, the fetcher
-    /// will determine the starting point automatically.
+    /// will begin retrieving data from this block height. If `None`, defaults to 0.
     pub start_block_height: Option<BlockHeight>,
 
     /// The duration for which the fetcher will sleep while waiting for the next universal last
