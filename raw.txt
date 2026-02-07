@@ -1,0 +1,57 @@
+WARNING: cqlsh was built against 5.0.0, but this server is 3.0.8.  All features may not work!
+
+ predecessor_id
+-------------------
+    plurality.near
+    plurality.near
+    plurality.near
+    plurality.near
+    plurality.near
+   contextual.near
+    plurality.near
+    plurality.near
+    plurality.near
+    plurality.near
+    plurality.near
+    plurality.near
+    plurality.near
+    plurality.near
+    plurality.near
+    plurality.near
+   contextual.near
+   contextual.near
+   contextual.near
+   contextual.near
+   contextual.near
+   contextual.near
+   contextual.near
+   contextual.near
+   contextual.near
+   contextual.near
+   contextual.near
+   contextual.near
+         hack.near
+       multai.near
+        james.near
+       multai.near
+   contextual.near
+         efiz.near
+         hack.near
+       multai.near
+        james.near
+       multai.near
+        james.near
+       multai.near
+   contextual.near
+         hack.near
+         hack.near
+        james.near
+   contextual.near
+         hack.near
+        james.near
+ fast_kv_test.near
+ fast_kv_test.near
+ nonresistant.near
+ nonresistant.near
+
+(51 rows)
