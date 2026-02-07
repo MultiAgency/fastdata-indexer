@@ -111,3 +111,228 @@ impl SimpleFastfs {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- is_valid_relative_path tests ---
+
+    #[test]
+    fn test_valid_simple_path() {
+        assert!(is_valid_relative_path("foo/bar.txt"));
+    }
+
+    #[test]
+    fn test_valid_single_file() {
+        assert!(is_valid_relative_path("file.txt"));
+    }
+
+    #[test]
+    fn test_valid_deep_path() {
+        assert!(is_valid_relative_path("a/b/c/d/e.json"));
+    }
+
+    #[test]
+    fn test_empty_path() {
+        assert!(!is_valid_relative_path(""));
+    }
+
+    #[test]
+    fn test_leading_slash() {
+        assert!(!is_valid_relative_path("/foo/bar"));
+    }
+
+    #[test]
+    fn test_trailing_slash() {
+        assert!(!is_valid_relative_path("foo/bar/"));
+    }
+
+    #[test]
+    fn test_dot_segment() {
+        assert!(!is_valid_relative_path("foo/./bar"));
+    }
+
+    #[test]
+    fn test_dotdot_segment() {
+        assert!(!is_valid_relative_path("foo/../bar"));
+    }
+
+    #[test]
+    fn test_empty_segment() {
+        assert!(!is_valid_relative_path("foo//bar"));
+    }
+
+    #[test]
+    fn test_null_byte() {
+        assert!(!is_valid_relative_path("foo\0bar"));
+    }
+
+    #[test]
+    fn test_percent_encoding() {
+        assert!(!is_valid_relative_path("foo/%2e%2e/bar"));
+    }
+
+    #[test]
+    fn test_non_ascii() {
+        assert!(!is_valid_relative_path("foo/b\u{00e4}r"));
+    }
+
+    #[test]
+    fn test_control_char() {
+        assert!(!is_valid_relative_path("foo/\x01bar"));
+    }
+
+    #[test]
+    fn test_backslash_start() {
+        assert!(!is_valid_relative_path("\\foo\\bar"));
+    }
+
+    #[test]
+    fn test_too_long_path() {
+        let long = "a".repeat(MAX_RELATIVE_PATH_LENGTH + 1);
+        assert!(!is_valid_relative_path(&long));
+    }
+
+    #[test]
+    fn test_max_length_path() {
+        let exact = "a".repeat(MAX_RELATIVE_PATH_LENGTH);
+        assert!(is_valid_relative_path(&exact));
+    }
+
+    // --- SimpleFastfs::is_valid tests ---
+
+    #[test]
+    fn test_simple_valid_with_content() {
+        let s = SimpleFastfs {
+            relative_path: "file.txt".into(),
+            content: Some(FastfsFileContent {
+                mime_type: "text/plain".into(),
+                content: vec![1, 2, 3],
+            }),
+        };
+        assert!(s.is_valid());
+    }
+
+    #[test]
+    fn test_simple_valid_deletion() {
+        let s = SimpleFastfs {
+            relative_path: "file.txt".into(),
+            content: None,
+        };
+        assert!(s.is_valid());
+    }
+
+    #[test]
+    fn test_simple_invalid_path() {
+        let s = SimpleFastfs {
+            relative_path: "../escape.txt".into(),
+            content: None,
+        };
+        assert!(!s.is_valid());
+    }
+
+    #[test]
+    fn test_simple_empty_mime() {
+        let s = SimpleFastfs {
+            relative_path: "file.txt".into(),
+            content: Some(FastfsFileContent {
+                mime_type: "".into(),
+                content: vec![1],
+            }),
+        };
+        assert!(!s.is_valid());
+    }
+
+    #[test]
+    fn test_simple_control_char_mime() {
+        let s = SimpleFastfs {
+            relative_path: "file.txt".into(),
+            content: Some(FastfsFileContent {
+                mime_type: "text/\x00plain".into(),
+                content: vec![1],
+            }),
+        };
+        assert!(!s.is_valid());
+    }
+
+    // --- PartialFastfs::is_valid tests ---
+
+    #[test]
+    fn test_partial_valid() {
+        let p = PartialFastfs {
+            relative_path: "file.bin".into(),
+            offset: 0,
+            full_size: OFFSET_ALIGNMENT,
+            mime_type: "application/octet-stream".into(),
+            content_chunk: vec![0u8; 100],
+            nonce: 1,
+        };
+        assert!(p.is_valid());
+    }
+
+    #[test]
+    fn test_partial_unaligned_offset() {
+        let p = PartialFastfs {
+            relative_path: "file.bin".into(),
+            offset: 500,
+            full_size: OFFSET_ALIGNMENT,
+            mime_type: "application/octet-stream".into(),
+            content_chunk: vec![0u8; 100],
+            nonce: 1,
+        };
+        assert!(!p.is_valid());
+    }
+
+    #[test]
+    fn test_partial_zero_full_size() {
+        let p = PartialFastfs {
+            relative_path: "file.bin".into(),
+            offset: 0,
+            full_size: 0,
+            mime_type: "application/octet-stream".into(),
+            content_chunk: vec![],
+            nonce: 1,
+        };
+        assert!(!p.is_valid());
+    }
+
+    #[test]
+    fn test_partial_nonce_zero() {
+        let p = PartialFastfs {
+            relative_path: "file.bin".into(),
+            offset: 0,
+            full_size: OFFSET_ALIGNMENT,
+            mime_type: "application/octet-stream".into(),
+            content_chunk: vec![0u8; 100],
+            nonce: 0,
+        };
+        assert!(!p.is_valid());
+    }
+
+    #[test]
+    fn test_partial_chunk_exceeds_full_size() {
+        let p = PartialFastfs {
+            relative_path: "file.bin".into(),
+            offset: 0,
+            full_size: 50,
+            mime_type: "application/octet-stream".into(),
+            content_chunk: vec![0u8; 100],
+            nonce: 1,
+        };
+        assert!(!p.is_valid());
+    }
+
+    #[test]
+    fn test_partial_invalid_path() {
+        let p = PartialFastfs {
+            relative_path: "/absolute/path".into(),
+            offset: 0,
+            full_size: OFFSET_ALIGNMENT,
+            mime_type: "text/plain".into(),
+            content_chunk: vec![0u8; 10],
+            nonce: 1,
+        };
+        assert!(!p.is_valid());
+    }
+}

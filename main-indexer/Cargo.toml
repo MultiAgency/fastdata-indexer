@@ -10,7 +10,7 @@ license.workspace = true
 [dependencies]
 scylladb = { path = "../scylladb" }
 
-dotenv.workspace = true
+dotenvy.workspace = true
 fastnear-primitives.workspace = true
 fastnear-neardata-fetcher.workspace = true
 reqwest.workspace = true

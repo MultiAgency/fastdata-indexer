@@ -5,9 +5,11 @@ use crate::fastfs::FastfsData;
 use crate::scylla_types::{
     add_fastfs_fastdata, create_tables, prepare_insert_query, FastfsFastData,
 };
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use fastnear_primitives::near_indexer_primitives::types::BlockHeight;
 use fastnear_primitives::types::ChainId;
+use scylla::statement::prepared::PreparedStatement;
+use scylladb::ScyllaDb;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,12 +21,49 @@ const PROJECT_ID: &str = "fastfs-sub-indexer";
 const SUFFIX: &str = "fastfs";
 const INDEXER_ID: &str = "fastfs_v2";
 
+async fn write_with_retries(
+    scylladb: &ScyllaDb,
+    insert_query: &PreparedStatement,
+    fastdata: FastfsFastData,
+) -> anyhow::Result<()> {
+    let delays = [1, 2, 4];
+    let mut last_error = None;
+
+    for (attempt, &delay_secs) in delays.iter().enumerate() {
+        if attempt > 0 {
+            tracing::warn!(
+                target: PROJECT_ID,
+                "Retrying DB write (attempt {}/{}) after {}s delay",
+                attempt + 1, delays.len(), delay_secs
+            );
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        }
+
+        match add_fastfs_fastdata(scylladb, insert_query, fastdata.clone()).await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                tracing::error!(
+                    target: PROJECT_ID,
+                    "DB write failed (attempt {}): {:?}",
+                    attempt + 1, e
+                );
+                last_error = Some(e);
+            }
+        }
+    }
+
+    Err(last_error.unwrap())
+}
+
 #[tokio::main]
 async fn main() {
     dotenv().ok();
 
     tracing_subscriber::fmt()
-        .with_env_filter("fastfs-sub-indexer=info,scylladb=info,suffix-fetcher=info")
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("fastfs-sub-indexer=info,scylladb=info,suffix-fetcher=info")),
+        )
         .init();
 
     let chain_id: ChainId = env::var("CHAIN_ID")
@@ -137,41 +176,10 @@ async fn main() {
                                 };
                                 tracing::info!(target: PROJECT_ID, "FastFS data {} bytes: {}/{}/{}", fastfs_fastdata.content.as_ref().map(|v| v.len()).unwrap_or(0), fastfs_fastdata.predecessor_id, fastfs_fastdata.current_account_id, fastfs_fastdata.relative_path);
 
-                                // Retry data write with delays
-                                let delays = [1, 2, 4];
-                                let mut last_error = None;
-
-                                for (attempt, &delay_secs) in delays.iter().enumerate() {
-                                    if attempt > 0 {
-                                        tracing::warn!(
-                                            target: PROJECT_ID,
-                                            "Retrying DB write (attempt {}/{}) after {}s delay",
-                                            attempt + 1, delays.len(), delay_secs
-                                        );
-                                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-                                    }
-
-                                    match add_fastfs_fastdata(&scylladb, &insert_query, fastfs_fastdata.clone()).await {
-                                        Ok(_) => {
-                                            last_error = None;
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            tracing::error!(
-                                                target: PROJECT_ID,
-                                                "DB write failed (attempt {}): {:?}",
-                                                attempt + 1, e
-                                            );
-                                            last_error = Some(e);
-                                        }
-                                    }
-                                }
-
-                                if let Some(e) = last_error {
+                                if let Err(e) = write_with_retries(&scylladb, &insert_query, fastfs_fastdata).await {
                                     tracing::error!(
                                         target: PROJECT_ID,
-                                        "Failed to write FastFS data after {} retries. Shutting down to prevent data loss: {:?}",
-                                        delays.len(), e
+                                        "Failed to write FastFS data after retries. Shutting down to prevent data loss: {:?}", e
                                     );
                                     is_running.store(false, Ordering::SeqCst);
                                     break;
@@ -206,41 +214,10 @@ async fn main() {
                                 };
                                 tracing::info!(target: PROJECT_ID, "FastFS partial data {} bytes: {}/{}/{} offset {}", fastfs_fastdata.content.as_ref().map(|v| v.len()).unwrap_or(0), fastfs_fastdata.predecessor_id, fastfs_fastdata.current_account_id, fastfs_fastdata.relative_path, fastfs_fastdata.offset);
 
-                                // Retry data write with delays
-                                let delays = [1, 2, 4];
-                                let mut last_error = None;
-
-                                for (attempt, &delay_secs) in delays.iter().enumerate() {
-                                    if attempt > 0 {
-                                        tracing::warn!(
-                                            target: PROJECT_ID,
-                                            "Retrying DB write (attempt {}/{}) after {}s delay",
-                                            attempt + 1, delays.len(), delay_secs
-                                        );
-                                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-                                    }
-
-                                    match add_fastfs_fastdata(&scylladb, &insert_query, fastfs_fastdata.clone()).await {
-                                        Ok(_) => {
-                                            last_error = None;
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            tracing::error!(
-                                                target: PROJECT_ID,
-                                                "DB write failed (attempt {}): {:?}",
-                                                attempt + 1, e
-                                            );
-                                            last_error = Some(e);
-                                        }
-                                    }
-                                }
-
-                                if let Some(e) = last_error {
+                                if let Err(e) = write_with_retries(&scylladb, &insert_query, fastfs_fastdata).await {
                                     tracing::error!(
                                         target: PROJECT_ID,
-                                        "Failed to write FastFS partial data after {} retries. Shutting down to prevent data loss: {:?}",
-                                        delays.len(), e
+                                        "Failed to write FastFS partial data after retries. Shutting down to prevent data loss: {:?}", e
                                     );
                                     is_running.store(false, Ordering::SeqCst);
                                     break;

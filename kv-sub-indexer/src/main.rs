@@ -1,7 +1,7 @@
 mod scylla_types;
 
 use crate::scylla_types::{add_kv_rows, FastDataKv, INDEXER_ID, SUFFIX};
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use fastnear_primitives::near_indexer_primitives::types::BlockHeight;
 use fastnear_primitives::types::ChainId;
 use scylla::statement::prepared::PreparedStatement;
@@ -132,7 +132,10 @@ async fn main() {
     dotenv().ok();
 
     tracing_subscriber::fmt()
-        .with_env_filter("kv-sub-indexer=info,scylladb=info,suffix-fetcher=info")
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("kv-sub-indexer=info,scylladb=info,suffix-fetcher=info")),
+        )
         .init();
 
     let chain_id: ChainId = env::var("CHAIN_ID")

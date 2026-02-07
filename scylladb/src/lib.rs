@@ -217,9 +217,9 @@ impl ScyllaDb {
                     self.select_fastdata_query_by_suffix_from.clone(),
                     (
                         suffix.to_string(),
-                        bucket as i64,
-                        from_block_height as i64,
-                        to_block_height as i64,
+                        i64::try_from(bucket).expect("bucket exceeds i64"),
+                        i64::try_from(from_block_height).expect("from_block_height exceeds i64"),
+                        i64::try_from(to_block_height).expect("to_block_height exceeds i64"),
                     ),
                 )
                 .await?
@@ -242,7 +242,7 @@ impl ScyllaDb {
         self.scylla_session
             .execute_unpaged(
                 &self.insert_last_processed_block_height_query,
-                (suffix.to_string(), last_processed_block_height as i64),
+                (suffix.to_string(), i64::try_from(last_processed_block_height).expect("block_height exceeds i64")),
             )
             .await?;
         Ok(())

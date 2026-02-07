@@ -34,6 +34,7 @@ NEAR Blockchain
 │  s_kv (history)    │  │  s_fastfs_v2             │
 │  s_kv_last (latest)│  └─────────────────────────┘
 │  kv_accounts       │
+│  kv_edges          │
 │  mv_kv_key (MV)    │
 │  mv_kv_cur_key (MV)│
 └────────────────────┘
@@ -83,8 +84,9 @@ Retry pattern everywhere: exponential backoff `[1s, 2s, 4s]` (sub-indexers) or `
 | 4 | `s_kv_last` | TABLE | `kv-sub-indexer/src/scylla_types.rs:130-146` | `(predecessor_id)` | `current_account_id, key` |
 | 5 | `mv_kv_key` | MAT. VIEW | `kv-sub-indexer/src/scylla_types.rs:147-151` | `(key)` | `block_height, order_id, predecessor_id, current_account_id` |
 | 6 | `mv_kv_cur_key` | MAT. VIEW | `kv-sub-indexer/src/scylla_types.rs:152-156` | `(current_account_id)` | `key, block_height, order_id, predecessor_id` |
-| 7 | `kv_accounts` | TABLE | `kv-sub-indexer/src/scylla_types.rs:157-162` | `(current_account_id)` | `key, predecessor_id` |
-| 8 | `s_fastfs_v2` | TABLE | `fastfs-sub-indexer/src/scylla_types.rs:113-131` | `(predecessor_id)` | `current_account_id, relative_path, nonce, offset` |
+| 7 | `kv_accounts` | TABLE | `kv-sub-indexer/src/scylla_types.rs:169-174` | `(current_account_id)` | `key, predecessor_id` |
+| 8 | `kv_edges` | TABLE | `kv-sub-indexer/src/scylla_types.rs:175-185` | `(edge_type, target)` | `source` |
+| 9 | `s_fastfs_v2` | TABLE | `fastfs-sub-indexer/src/scylla_types.rs:113-131` | `(predecessor_id)` | `current_account_id, relative_path, nonce, offset` |
 
 ## 5. Environment Variables
 
@@ -117,6 +119,6 @@ Retry pattern everywhere: exponential backoff `[1s, 2s, 4s]` (sub-indexers) or `
 - **order_id formula**: `(shard_id * 100000 + receipt_index) * 1000 + action_index` — deterministic within a block, validated for overflow
 - **Deterministic LWW**: `s_kv_last` writes use `USING TIMESTAMP` with `block_height * 1B + order_id` so blockchain ordering always wins over wall-clock time on crash/replay
 - **Graceful shutdown**: All binaries use an `is_running` AtomicBool flag instead of `process::exit()`, allowing Tokio to drain connections
-- **Block gap detection**: main-indexer tracks expected block height and halts on gaps to prevent silent data loss
+- **KV edge detection**: `kv_edges` table auto-detects graph edges from KV keys of the form `{edge_type}/{target}`, using `USING TIMESTAMP` for deterministic LWW
 - **KV data format**: JSON object → exploded into one row per key, value re-serialized to string
 - **FastFS data format**: Borsh-encoded enum with `SimpleFastfs` (whole file) and `PartialFastfs` (chunked upload)

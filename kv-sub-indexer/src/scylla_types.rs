@@ -104,11 +104,11 @@ impl From<FastDataKv> for FastDataKvRow {
             signer_id: data.signer_id.to_string(),
             predecessor_id: data.predecessor_id.to_string(),
             current_account_id: data.current_account_id.to_string(),
-            block_height: data.block_height as i64,
-            block_timestamp: data.block_timestamp as i64,
+            block_height: i64::try_from(data.block_height).expect("block_height exceeds i64"),
+            block_timestamp: i64::try_from(data.block_timestamp).expect("block_timestamp exceeds i64"),
             shard_id: i32::try_from(data.shard_id).expect("shard_id exceeds i32"),
             receipt_index: i32::try_from(data.receipt_index).expect("receipt_index exceeds i32"),
-            order_id: data.order_id as i64,
+            order_id: i64::try_from(data.order_id).expect("order_id exceeds i64"),
             key: data.key,
             value: data.value,
         }
@@ -292,7 +292,8 @@ pub(crate) async fn add_kv_rows(
             }
         }
     }
-    let kv_last_rows: Vec<_> = kv_last_map.into_values().collect();
+    let mut kv_last_rows: Vec<_> = kv_last_map.into_values().collect();
+    kv_last_rows.sort_by(|a, b| (b.block_height, b.order_id).cmp(&(a.block_height, a.order_id)));
 
     // Write kv_rows in chunks
     for chunk in kv_rows.chunks(BATCH_CHUNK_SIZE) {
@@ -375,7 +376,7 @@ pub(crate) async fn add_kv_rows(
 
     // Write checkpoint only when a block height is provided
     if let Some(height) = last_processed_block_height {
-        let checkpoint_row = (INDEXER_ID.to_string(), height as i64);
+        let checkpoint_row = (INDEXER_ID.to_string(), i64::try_from(height).expect("checkpoint height exceeds i64"));
         scylla_db
             .scylla_session
             .execute_unpaged(

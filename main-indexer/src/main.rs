@@ -1,4 +1,4 @@
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use fastnear_neardata_fetcher::fetcher;
 use fastnear_primitives::near_indexer_primitives::types::BlockHeight;
 use fastnear_primitives::near_primitives::views::{ActionView, ReceiptEnumView};
@@ -19,7 +19,10 @@ async fn main() {
     dotenv().ok();
 
     tracing_subscriber::fmt()
-        .with_env_filter("neardata-fetcher=info,fastdata-indexer=info,scylladb=info")
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("neardata-fetcher=info,fastdata-indexer=info,scylladb=info")),
+        )
         .init();
 
     let chain_id: ChainId = env::var("CHAIN_ID")
@@ -166,7 +169,7 @@ async fn main() {
                                 }
                                 data.push(FastData {
                                     receipt_id,
-                                    action_index: action_index as _,
+                                    action_index: u32::try_from(action_index).expect("action_index exceeds u32"),
                                     suffix: suffix.to_string(),
                                     data: args.to_vec(),
                                     tx_hash,
@@ -176,7 +179,7 @@ async fn main() {
                                     block_height,
                                     block_timestamp,
                                     shard_id: shard.shard_id.into(),
-                                    receipt_index: receipt_index as _,
+                                    receipt_index: u32::try_from(receipt_index).expect("receipt_index exceeds u32"),
                                 });
                             }
                         }
