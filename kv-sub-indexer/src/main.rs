@@ -94,6 +94,7 @@ async fn flush_rows(
     kv_last_insert_query: &PreparedStatement,
     kv_accounts_insert_query: &PreparedStatement,
     kv_edges_insert_query: &PreparedStatement,
+    kv_reverse_insert_query: &PreparedStatement,
     rows: &[FastDataKv],
     checkpoint: Option<BlockHeight>,
 ) -> anyhow::Result<()> {
@@ -110,7 +111,7 @@ async fn flush_rows(
             tokio::time::sleep(Duration::from_secs(delay_secs)).await;
         }
 
-        match add_kv_rows(scylladb, kv_insert_query, kv_last_insert_query, kv_accounts_insert_query, kv_edges_insert_query, rows, checkpoint).await
+        match add_kv_rows(scylladb, kv_insert_query, kv_last_insert_query, kv_accounts_insert_query, kv_edges_insert_query, kv_reverse_insert_query, rows, checkpoint).await
         {
             Ok(_) => return Ok(()),
             Err(e) => {
@@ -169,6 +170,10 @@ async fn main() {
         .await
         .expect("Error preparing kv_edges insert query");
 
+    let kv_reverse_insert_query = scylla_types::prepare_kv_reverse_insert_query(&scylladb)
+        .await
+        .expect("Error preparing kv_reverse insert query");
+
     let last_processed_block_height = scylladb
         .get_last_processed_block_height(INDEXER_ID)
         .await
@@ -225,7 +230,7 @@ async fn main() {
 
                     if let Err(e) = flush_rows(
                         &scylladb, &kv_insert_query, &kv_last_insert_query, &kv_accounts_insert_query,
-                        &kv_edges_insert_query,
+                        &kv_edges_insert_query, &kv_reverse_insert_query,
                         &current_rows, None,
                     ).await {
                         tracing::error!(target: PROJECT_ID,
@@ -242,7 +247,7 @@ async fn main() {
 
                 if let Err(e) = flush_rows(
                     &scylladb, &kv_insert_query, &kv_last_insert_query, &kv_accounts_insert_query,
-                    &kv_edges_insert_query,
+                    &kv_edges_insert_query, &kv_reverse_insert_query,
                     &current_rows, Some(block_height),
                 ).await {
                     tracing::error!(target: PROJECT_ID,

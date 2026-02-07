@@ -183,6 +183,22 @@ pub(crate) async fn create_tables(scylla_db: &ScyllaDb) -> anyhow::Result<()> {
             value text,
             PRIMARY KEY ((edge_type, target), source)
         )",
+        "CREATE TABLE IF NOT EXISTS kv_reverse (
+            current_account_id text,
+            key text,
+            predecessor_id text,
+            receipt_id text,
+            action_index int,
+            tx_hash text,
+            signer_id text,
+            block_height bigint,
+            block_timestamp bigint,
+            shard_id int,
+            receipt_index int,
+            order_id bigint,
+            value text,
+            PRIMARY KEY ((current_account_id, key), predecessor_id)
+        )",
     ];
     for query in queries.iter() {
         tracing::debug!(target: SCYLLADB, "Creating table: {}", query);
@@ -235,6 +251,17 @@ pub(crate) async fn prepare_kv_edges_insert_query(
     .await
 }
 
+pub(crate) async fn prepare_kv_reverse_insert_query(
+    scylla_db: &ScyllaDb,
+) -> anyhow::Result<PreparedStatement> {
+    ScyllaDb::prepare_query(
+        &scylla_db.scylla_session,
+        "INSERT INTO kv_reverse (current_account_id, key, predecessor_id, receipt_id, action_index, tx_hash, signer_id, block_height, block_timestamp, shard_id, receipt_index, order_id, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        scylla::frame::types::Consistency::LocalQuorum,
+    )
+    .await
+}
+
 /// Auto-detects a graph edge from a KV key.
 /// Key format: `{source}/{...edge_type...}/{target}`
 /// An edge is detected when:
@@ -269,6 +296,7 @@ pub(crate) async fn add_kv_rows(
     kv_last_insert_query: &PreparedStatement,
     kv_accounts_insert_query: &PreparedStatement,
     kv_edges_insert_query: &PreparedStatement,
+    kv_reverse_insert_query: &PreparedStatement,
     rows: &[FastDataKv],
     last_processed_block_height: Option<BlockHeight>,
 ) -> anyhow::Result<()> {
@@ -306,7 +334,7 @@ pub(crate) async fn add_kv_rows(
         scylla_db.scylla_session.batch(&batch, values).await?;
     }
 
-    // Write kv_last_rows with USING TIMESTAMP for deterministic last-write-wins ordering.
+    // Write kv_last_rows and kv_reverse with USING TIMESTAMP for deterministic last-write-wins ordering.
     // This prevents stale overwrites on crash/replay: blockchain ordering always wins
     // over wall-clock time, regardless of write order or duplicate writes.
     for kv_last in &kv_last_rows {
@@ -314,9 +342,21 @@ pub(crate) async fn add_kv_rows(
         // Max order_id ≈ shard_count * 100_000 * 1_000 ≈ 600M (6 shards). With 1B multiplier,
         // block_height can reach ~9.2B before i64 overflow (current NEAR height: ~150M).
         let ts = (kv_last.block_height) * 1_000_000_000 + kv_last.order_id;
+
         let mut stmt = kv_last_insert_query.clone();
         stmt.set_timestamp(Some(ts));
         scylla_db.scylla_session.execute_unpaged(&stmt, kv_last).await?;
+
+        // kv_reverse: same row repartitioned by (current_account_id, key) for cursor pagination
+        let mut stmt = kv_reverse_insert_query.clone();
+        stmt.set_timestamp(Some(ts));
+        let row = (
+            &kv_last.current_account_id, &kv_last.key, &kv_last.predecessor_id,
+            &kv_last.receipt_id, &kv_last.action_index, &kv_last.tx_hash,
+            &kv_last.signer_id, &kv_last.block_height, &kv_last.block_timestamp,
+            &kv_last.shard_id, &kv_last.receipt_index, &kv_last.order_id, &kv_last.value,
+        );
+        scylla_db.scylla_session.execute_unpaged(&stmt, row).await?;
     }
 
     // Write kv_accounts (unique tuples from kv_last_rows)
