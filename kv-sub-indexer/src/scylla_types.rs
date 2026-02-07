@@ -199,6 +199,11 @@ pub(crate) async fn create_tables(scylla_db: &ScyllaDb) -> anyhow::Result<()> {
             value text,
             PRIMARY KEY ((current_account_id, key), predecessor_id)
         )",
+        "CREATE TABLE IF NOT EXISTS all_accounts (
+            account_id text PRIMARY KEY,
+            last_block_height bigint,
+            last_block_timestamp bigint
+        )",
     ];
     for query in queries.iter() {
         tracing::debug!(target: SCYLLADB, "Creating table: {}", query);
@@ -262,6 +267,17 @@ pub(crate) async fn prepare_kv_reverse_insert_query(
     .await
 }
 
+pub(crate) async fn prepare_all_accounts_insert_query(
+    scylla_db: &ScyllaDb,
+) -> anyhow::Result<PreparedStatement> {
+    ScyllaDb::prepare_query(
+        &scylla_db.scylla_session,
+        "INSERT INTO all_accounts (account_id, last_block_height, last_block_timestamp) VALUES (?, ?, ?)",
+        scylla::frame::types::Consistency::LocalQuorum,
+    )
+    .await
+}
+
 /// Auto-detects a graph edge from a KV key.
 /// Key must have at least 2 `/`-separated segments.
 /// Last segment = target, all preceding segments joined by `/` = edge_type.
@@ -295,6 +311,7 @@ pub(crate) async fn add_kv_rows(
     kv_accounts_insert_query: &PreparedStatement,
     kv_edges_insert_query: &PreparedStatement,
     kv_reverse_insert_query: &PreparedStatement,
+    all_accounts_insert_query: &PreparedStatement,
     rows: &[FastDataKv],
     last_processed_block_height: Option<BlockHeight>,
 ) -> anyhow::Result<()> {
@@ -409,6 +426,32 @@ pub(crate) async fn add_kv_rows(
             let mut stmt = kv_edges_insert_query.clone();
             stmt.set_timestamp(Some(ts));
             scylla_db.scylla_session.execute_unpaged(&stmt, edge).await?;
+        }
+    }
+
+    // Write all_accounts: one INSERT per unique predecessor_id, latest block wins via USING TIMESTAMP
+    {
+        let mut account_max: HashMap<&str, &FastDataKvRow> = HashMap::new();
+        for row in &kv_last_rows {
+            account_max
+                .entry(row.predecessor_id.as_str())
+                .and_modify(|existing| {
+                    if (row.block_height, row.order_id) > (existing.block_height, existing.order_id) {
+                        *existing = row;
+                    }
+                })
+                .or_insert(row);
+        }
+        for (account_id, row) in &account_max {
+            let ts = row.block_height.checked_mul(1_000_000_000)
+                .and_then(|v| v.checked_add(row.order_id))
+                .ok_or_else(|| anyhow::anyhow!(
+                    "all_accounts USING TIMESTAMP overflow: block_height={}, order_id={}",
+                    row.block_height, row.order_id
+                ))?;
+            let mut stmt = all_accounts_insert_query.clone();
+            stmt.set_timestamp(Some(ts));
+            scylla_db.scylla_session.execute_unpaged(&stmt, (account_id, &row.block_height, &row.block_timestamp)).await?;
         }
     }
 

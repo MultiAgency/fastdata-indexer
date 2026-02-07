@@ -72,8 +72,9 @@ Replication: NetworkTopologyStrategy dc1=3, tablets enabled
 | 6 | `s_fastfs_v2` | `fastfs-sub-indexer/src/scylla_types.rs:147` | Individual | LocalQuorum |
 | 7 | `kv_edges` | `kv-sub-indexer/src/scylla_types.rs:248` | Individual with `USING TIMESTAMP` | LocalQuorum |
 | 8 | `kv_reverse` | `kv-sub-indexer/src/scylla_types.rs:259` | Individual with `USING TIMESTAMP` | LocalQuorum |
+| 9 | `all_accounts` | `kv-sub-indexer/src/scylla_types.rs:275` | Individual with `USING TIMESTAMP` | LocalQuorum |
 
-The `add_kv_rows()` function at `kv-sub-indexer/src/scylla_types.rs:293-430` orchestrates writes #3, #4, #5, #7, #8, and an optional checkpoint (#2) in a single call. Deduplication for `s_kv_last` happens at lines 308-322 via explicit `(block_height, order_id)` comparison, keeping the highest value. Writes #4, #7, and #8 use `USING TIMESTAMP` with `block_height * 1B + order_id` to ensure deterministic last-write-wins ordering based on blockchain order rather than wall-clock time.
+The `add_kv_rows()` function at `kv-sub-indexer/src/scylla_types.rs:293-450` orchestrates writes #3, #4, #5, #7, #8, #9, and an optional checkpoint (#2) in a single call. Deduplication for `s_kv_last` happens at lines 308-322 via explicit `(block_height, order_id)` comparison, keeping the highest value. Writes #4, #7, and #8 use `USING TIMESTAMP` with `block_height * 1B + order_id` to ensure deterministic last-write-wins ordering based on blockchain order rather than wall-clock time.
 
 Retry pattern everywhere: exponential backoff `[1s, 2s, 4s]` (sub-indexers) or `[0s, 1s, 2s, 4s]` (main-indexer). Graceful shutdown via `is_running` flag on final failure to prevent data loss.
 
@@ -91,6 +92,7 @@ Retry pattern everywhere: exponential backoff `[1s, 2s, 4s]` (sub-indexers) or `
 | 8 | `kv_edges` | TABLE | `kv-sub-indexer/src/scylla_types.rs:175-185` | `(edge_type, target)` | `source` |
 | 9 | `s_fastfs_v2` | TABLE | `fastfs-sub-indexer/src/scylla_types.rs:113-131` | `(predecessor_id)` | `current_account_id, relative_path, nonce, offset` |
 | 10 | `kv_reverse` | TABLE | `kv-sub-indexer/src/scylla_types.rs:186-201` | `(current_account_id, key)` | `predecessor_id` |
+| 11 | `all_accounts` | TABLE | `kv-sub-indexer/src/scylla_types.rs:202-206` | `(account_id)` | — |
 
 ## 5. Environment Variables
 
