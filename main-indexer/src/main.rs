@@ -128,25 +128,11 @@ async fn main() {
     ));
 
     let mut last_block_update = std::time::SystemTime::now();
-    let mut expected_block_height: Option<BlockHeight> = None;
     let mut consecutive_checkpoint_failures: u32 = 0;
     const MAX_CONSECUTIVE_CHECKPOINT_FAILURES: u32 = 5;
     while let Some(block) = receiver.recv().await {
         let block_height = block.block.header.height;
         let block_timestamp = block.block.header.timestamp;
-
-        if let Some(expected) = expected_block_height {
-            if block_height != expected {
-                tracing::error!(
-                    target: PROJECT_ID,
-                    "BLOCK GAP DETECTED: expected block {}, got {}. {} blocks missing! Halting to prevent data loss.",
-                    expected, block_height, block_height.saturating_sub(expected)
-                );
-                is_running.store(false, Ordering::SeqCst);
-                break;
-            }
-        }
-        expected_block_height = Some(block_height + 1);
 
         tracing::info!(target: PROJECT_ID, "Received block: {}", block_height);
 
