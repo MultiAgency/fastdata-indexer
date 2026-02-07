@@ -18,7 +18,6 @@ use tokio::sync::mpsc;
 const PROJECT_ID: &str = "fastfs-sub-indexer";
 const SUFFIX: &str = "fastfs";
 const INDEXER_ID: &str = "fastfs_v2";
-const MAX_FASTFS_DATA_SIZE: usize = 33_555_456; // 32MB + 1KB overhead
 
 #[tokio::main]
 async fn main() {
@@ -95,14 +94,6 @@ async fn main() {
         match update {
             SuffixFetcherUpdate::FastData(fastdata) => {
                 tracing::info!(target: PROJECT_ID, "Received fastdata: {} {} {}", fastdata.block_height, fastdata.receipt_id, fastdata.action_index);
-                if fastdata.data.len() > MAX_FASTFS_DATA_SIZE {
-                    tracing::warn!(
-                        target: PROJECT_ID,
-                        "Skipping oversized fastfs data ({} bytes) for receipt {} action {}",
-                        fastdata.data.len(), fastdata.receipt_id, fastdata.action_index
-                    );
-                    continue;
-                }
                 let value: FastfsData = match borsh::from_slice(&fastdata.data) {
                     Ok(v) => v,
                     Err(e) => {

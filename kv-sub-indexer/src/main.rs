@@ -16,20 +16,8 @@ use tokio::sync::mpsc;
 const PROJECT_ID: &str = "kv-sub-indexer";
 const MAX_NUM_KEYS: usize = 256;
 const MAX_KEY_LENGTH: usize = 1024;
-const MAX_VALUE_LENGTH: usize = 1_048_576;
-const MAX_TOTAL_BYTES: usize = 256_000_000;
-const MAX_KV_DATA_SIZE: usize = 4_194_304; // 4MB — defense-in-depth (main-indexer also caps at 4MB)
-const ENTRY_OVERHEAD: usize = 320; // Approximate FastDataKv struct + String metadata per entry
 
 fn parse_kv_entries(fastdata: &scylladb::FastData) -> Vec<FastDataKv> {
-    if fastdata.data.len() > MAX_KV_DATA_SIZE {
-        tracing::warn!(
-            target: PROJECT_ID,
-            "Skipping oversized KV data ({} bytes) for receipt {} action {}",
-            fastdata.data.len(), fastdata.receipt_id, fastdata.action_index
-        );
-        return vec![];
-    }
     let json_value = match serde_json::from_slice::<serde_json::Value>(&fastdata.data) {
         Ok(v) => v,
         Err(_) => {
@@ -81,10 +69,6 @@ fn parse_kv_entries(fastdata: &scylladb::FastData) -> Vec<FastDataKv> {
                 continue;
             }
         };
-        if serialized_value.len() > MAX_VALUE_LENGTH {
-            tracing::debug!(target: PROJECT_ID, "Received Key-Value Fastdata with value too large: {} bytes", serialized_value.len());
-            continue;
-        }
         entries.push(FastDataKv {
             receipt_id: fastdata.receipt_id,
             action_index: fastdata.action_index,
@@ -109,6 +93,7 @@ async fn flush_rows(
     kv_insert_query: &PreparedStatement,
     kv_last_insert_query: &PreparedStatement,
     kv_accounts_insert_query: &PreparedStatement,
+    kv_edges_insert_query: &PreparedStatement,
     rows: &[FastDataKv],
     checkpoint: Option<BlockHeight>,
 ) -> anyhow::Result<()> {
@@ -125,7 +110,7 @@ async fn flush_rows(
             tokio::time::sleep(Duration::from_secs(delay_secs)).await;
         }
 
-        match add_kv_rows(scylladb, kv_insert_query, kv_last_insert_query, kv_accounts_insert_query, rows, checkpoint).await
+        match add_kv_rows(scylladb, kv_insert_query, kv_last_insert_query, kv_accounts_insert_query, kv_edges_insert_query, rows, checkpoint).await
         {
             Ok(_) => return Ok(()),
             Err(e) => {
@@ -177,6 +162,10 @@ async fn main() {
         .await
         .expect("Error preparing kv_accounts insert query");
 
+    let kv_edges_insert_query = scylla_types::prepare_kv_edges_insert_query(&scylladb)
+        .await
+        .expect("Error preparing kv_edges insert query");
+
     let last_processed_block_height = scylladb
         .get_last_processed_block_height(INDEXER_ID)
         .await
@@ -219,24 +208,21 @@ async fn main() {
     ));
 
     let mut rows: Vec<FastDataKv> = vec![];
-    let mut total_bytes: usize = 0;
     while let Some(update) = receiver.recv().await {
         match update {
             SuffixFetcherUpdate::FastData(fastdata) => {
                 tracing::info!(target: PROJECT_ID, "Received fastdata: {} {} {}", fastdata.block_height, fastdata.receipt_id, fastdata.action_index);
 
                 let new_entries = parse_kv_entries(&fastdata);
-                total_bytes +=
-                    new_entries.iter().map(|e| e.key.len() + e.value.len() + ENTRY_OVERHEAD).sum::<usize>();
                 rows.extend(new_entries);
 
-                if rows.len() >= 10_000 || total_bytes >= MAX_TOTAL_BYTES {
-                    tracing::info!(target: PROJECT_ID, "Early flush at {} rows ({} bytes)", rows.len(), total_bytes);
+                if rows.len() >= 10_000 {
+                    tracing::info!(target: PROJECT_ID, "Early flush at {} rows", rows.len());
                     let current_rows = std::mem::take(&mut rows);
-                    total_bytes = 0;
 
                     if let Err(e) = flush_rows(
                         &scylladb, &kv_insert_query, &kv_last_insert_query, &kv_accounts_insert_query,
+                        &kv_edges_insert_query,
                         &current_rows, None,
                     ).await {
                         tracing::error!(target: PROJECT_ID,
@@ -250,10 +236,10 @@ async fn main() {
             SuffixFetcherUpdate::EndOfRange(block_height) => {
                 tracing::info!(target: PROJECT_ID, "Saving last processed block height {} with {} rows", block_height, rows.len());
                 let current_rows = std::mem::take(&mut rows);
-                total_bytes = 0;
 
                 if let Err(e) = flush_rows(
                     &scylladb, &kv_insert_query, &kv_last_insert_query, &kv_accounts_insert_query,
+                    &kv_edges_insert_query,
                     &current_rows, Some(block_height),
                 ).await {
                     tracing::error!(target: PROJECT_ID,

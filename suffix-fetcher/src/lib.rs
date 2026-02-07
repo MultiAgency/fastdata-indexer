@@ -135,16 +135,10 @@ impl SuffixFetcher {
                 };
 
                 let mut had_error = false;
-                const STREAM_ITEM_TIMEOUT: Duration = Duration::from_secs(60);
                 loop {
-                    let fastdata = match tokio::time::timeout(STREAM_ITEM_TIMEOUT, stream.next()).await {
-                        Ok(Some(item)) => item,
-                        Ok(None) => break, // Stream exhausted normally
-                        Err(_) => {
-                            tracing::error!(target: FETCHER, "Stream read timed out after {:?}", STREAM_ITEM_TIMEOUT);
-                            had_error = true;
-                            break;
-                        }
+                    let fastdata = match stream.next().await {
+                        Some(item) => item,
+                        None => break, // Stream exhausted normally
                     };
                     if !is_running.load(Ordering::SeqCst) {
                         range_success = true;

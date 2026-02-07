@@ -27,7 +27,7 @@ fastnear neardata API (HTTP)
 s_kv, s_kv_last    s_fastfs_v2
 mv_kv_key          (file chunks)
 mv_kv_cur_key
-mv_kv_by_contract
+kv_accounts
 ```
 
 ## Quick Start
@@ -211,7 +211,7 @@ Processes KV entries from `blobs` table into dedicated KV tables with optimized 
 - `s_kv_last` - Latest value per key (for fast lookups)
 - `mv_kv_key` - Materialized view indexed by key
 - `mv_kv_cur_key` - Materialized view for reverse lookups by account
-- `mv_kv_by_contract` - Materialized view to find all accounts that wrote to a contract
+- `kv_accounts` - Lookup table for accounts by contract
 
 **Indexer ID:** `kv-1`
 
@@ -376,23 +376,20 @@ CREATE MATERIALIZED VIEW mv_kv_cur_key AS
     PRIMARY KEY ((current_account_id), key, block_height, order_id, predecessor_id);
 ```
 
-**mv_kv_by_contract** - Query all accounts that wrote to a contract (without specifying key):
+**kv_accounts** - Lookup table for accounts that wrote to a contract:
 
 ```sql
-CREATE MATERIALIZED VIEW mv_kv_by_contract AS
-    SELECT predecessor_id, current_account_id, key, value
-    FROM s_kv_last
-    WHERE current_account_id IS NOT NULL
-    AND predecessor_id IS NOT NULL
-    AND key IS NOT NULL
-    AND value IS NOT NULL
-    PRIMARY KEY ((current_account_id), predecessor_id, key)
-    WITH CLUSTERING ORDER BY (predecessor_id ASC, key ASC);
+CREATE TABLE IF NOT EXISTS kv_accounts (
+    current_account_id text,
+    key text,
+    predecessor_id text,
+    PRIMARY KEY ((current_account_id), key, predecessor_id)
+);
 ```
 
 Example query to find all accounts that wrote to a contract:
 ```sql
-SELECT DISTINCT predecessor_id FROM mv_kv_by_contract WHERE current_account_id = 'mycontract.near';
+SELECT * FROM kv_accounts WHERE current_account_id = 'mycontract.near';
 ```
 
 ### s_fastfs_v2 (fastfs-sub-indexer output)

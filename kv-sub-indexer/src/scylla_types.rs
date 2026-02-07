@@ -47,6 +47,18 @@ pub(crate) struct FastDataKvRow {
     pub value: String,
 }
 
+#[derive(Debug, Clone, SerializeRow)]
+pub(crate) struct KvEdgeRow {
+    pub edge_type: String,
+    pub target: String,
+    pub source: String,
+    pub current_account_id: String,
+    pub block_height: i64,
+    pub block_timestamp: i64,
+    pub order_id: i64,
+    pub value: String,
+}
+
 impl TryFrom<FastDataKvRow> for FastDataKv {
     type Error = anyhow::Error;
 
@@ -160,6 +172,17 @@ pub(crate) async fn create_tables(scylla_db: &ScyllaDb) -> anyhow::Result<()> {
             predecessor_id text,
             PRIMARY KEY ((current_account_id), key, predecessor_id)
         )",
+        "CREATE TABLE IF NOT EXISTS kv_edges (
+            edge_type text,
+            target text,
+            source text,
+            current_account_id text,
+            block_height bigint,
+            block_timestamp bigint,
+            order_id bigint,
+            value text,
+            PRIMARY KEY ((edge_type, target), source)
+        )",
     ];
     for query in queries.iter() {
         tracing::debug!(target: SCYLLADB, "Creating table: {}", query);
@@ -201,6 +224,43 @@ pub(crate) async fn prepare_kv_accounts_insert_query(
     .await
 }
 
+pub(crate) async fn prepare_kv_edges_insert_query(
+    scylla_db: &ScyllaDb,
+) -> anyhow::Result<PreparedStatement> {
+    ScyllaDb::prepare_query(
+        &scylla_db.scylla_session,
+        "INSERT INTO kv_edges (edge_type, target, source, current_account_id, block_height, block_timestamp, order_id, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        scylla::frame::types::Consistency::LocalQuorum,
+    )
+    .await
+}
+
+/// Auto-detects a graph edge from a KV key.
+/// Key format: `{source}/{...edge_type...}/{target}`
+/// An edge is detected when:
+/// - At least 3 segments separated by `/`
+/// - First segment (source) equals `predecessor_id`
+/// - Last segment = target, middle segments joined by `/` = edge_type
+pub(crate) fn extract_edge(key: &str, predecessor_id: &str) -> Option<(String, String, String)> {
+    let segments: Vec<&str> = key.split('/').collect();
+    if segments.len() < 3 {
+        return None;
+    }
+    let source = segments[0];
+    if source.is_empty() || source != predecessor_id {
+        return None;
+    }
+    let target = segments[segments.len() - 1];
+    if target.is_empty() {
+        return None;
+    }
+    let edge_type = segments[1..segments.len() - 1].join("/");
+    if edge_type.is_empty() {
+        return None;
+    }
+    Some((edge_type, source.to_string(), target.to_string()))
+}
+
 const BATCH_CHUNK_SIZE: usize = 100;
 
 pub(crate) async fn add_kv_rows(
@@ -208,6 +268,7 @@ pub(crate) async fn add_kv_rows(
     kv_insert_query: &PreparedStatement,
     kv_last_insert_query: &PreparedStatement,
     kv_accounts_insert_query: &PreparedStatement,
+    kv_edges_insert_query: &PreparedStatement,
     rows: &[FastDataKv],
     last_processed_block_height: Option<BlockHeight>,
 ) -> anyhow::Result<()> {
@@ -280,6 +341,38 @@ pub(crate) async fn add_kv_rows(
         scylla_db.scylla_session.batch(&batch, values).await?;
     }
 
+    // Write kv_edges for auto-detected graph edges
+    {
+        let mut edge_rows: Vec<KvEdgeRow> = Vec::new();
+        let mut edge_dedup: HashSet<(String, String, String)> = HashSet::new();
+
+        for row in &kv_last_rows {
+            if let Some((edge_type, source, target)) = extract_edge(&row.key, &row.predecessor_id) {
+                let dedup_key = (edge_type.clone(), target.clone(), source.clone());
+                if !edge_dedup.insert(dedup_key) {
+                    continue;
+                }
+                edge_rows.push(KvEdgeRow {
+                    edge_type,
+                    target,
+                    source,
+                    current_account_id: row.current_account_id.clone(),
+                    block_height: row.block_height,
+                    block_timestamp: row.block_timestamp,
+                    order_id: row.order_id,
+                    value: row.value.clone(),
+                });
+            }
+        }
+
+        for edge in &edge_rows {
+            let ts = edge.block_height * 1_000_000_000 + edge.order_id;
+            let mut stmt = kv_edges_insert_query.clone();
+            stmt.set_timestamp(Some(ts));
+            scylla_db.scylla_session.execute_unpaged(&stmt, edge).await?;
+        }
+    }
+
     // Write checkpoint only when a block height is provided
     if let Some(height) = last_processed_block_height {
         let checkpoint_row = (INDEXER_ID.to_string(), height as i64);
@@ -293,4 +386,90 @@ pub(crate) async fn add_kv_rows(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_edge_follow() {
+        assert_eq!(
+            extract_edge("alice.near/legion/follow/bob.near", "alice.near"),
+            Some(("legion/follow".into(), "alice.near".into(), "bob.near".into()))
+        );
+    }
+
+    #[test]
+    fn test_extract_edge_graph_follow() {
+        assert_eq!(
+            extract_edge("alice.near/graph/follow/bob.near", "alice.near"),
+            Some(("graph/follow".into(), "alice.near".into(), "bob.near".into()))
+        );
+    }
+
+    #[test]
+    fn test_extract_edge_single_segment_type() {
+        assert_eq!(
+            extract_edge("alice.near/follow/bob.near", "alice.near"),
+            Some(("follow".into(), "alice.near".into(), "bob.near".into()))
+        );
+    }
+
+    #[test]
+    fn test_extract_edge_deep_type() {
+        assert_eq!(
+            extract_edge("alice.near/a/b/c/bob.near", "alice.near"),
+            Some(("a/b/c".into(), "alice.near".into(), "bob.near".into()))
+        );
+    }
+
+    #[test]
+    fn test_extract_edge_predecessor_mismatch() {
+        assert_eq!(extract_edge("alice.near/legion/follow/bob.near", "carol.near"), None);
+    }
+
+    #[test]
+    fn test_extract_edge_too_few_segments() {
+        assert_eq!(extract_edge("alice.near/bob.near", "alice.near"), None);
+    }
+
+    #[test]
+    fn test_extract_edge_non_account_target() {
+        assert_eq!(
+            extract_edge("alice.near/like/post/12345", "alice.near"),
+            Some(("like/post".into(), "alice.near".into(), "12345".into()))
+        );
+    }
+
+    #[test]
+    fn test_extract_edge_profile_name() {
+        assert_eq!(
+            extract_edge("alice.near/profile/name", "alice.near"),
+            Some(("profile".into(), "alice.near".into(), "name".into()))
+        );
+    }
+
+    #[test]
+    fn test_extract_edge_empty_target() {
+        assert_eq!(extract_edge("alice.near/legion/follow/", "alice.near"), None);
+    }
+
+    #[test]
+    fn test_extract_edge_empty_source() {
+        assert_eq!(extract_edge("/legion/follow/bob.near", ""), None);
+    }
+
+    #[test]
+    fn test_extract_edge_no_slash() {
+        assert_eq!(extract_edge("justadata", "justadata"), None);
+    }
+
+    #[test]
+    fn test_extract_edge_custom_subscribe() {
+        assert_eq!(
+            extract_edge("alice.near/custom/subscribe/channel.near", "alice.near"),
+            Some(("custom/subscribe".into(), "alice.near".into(), "channel.near".into()))
+        );
+    }
 }

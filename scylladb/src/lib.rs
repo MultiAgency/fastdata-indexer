@@ -124,7 +124,7 @@ impl ScyllaDb {
             select_fastdata_query_by_suffix_from: Self::prepare_query(
                 &scylla_session,
                 "SELECT * FROM blobs WHERE suffix = ? AND block_height_bucket = ? AND block_height >= ? AND block_height <= ?",
-                scylla::frame::types::Consistency::LocalQuorum,
+                scylla::frame::types::Consistency::LocalOne,
             ).await?,
             insert_last_processed_block_height_query: Self::prepare_query(
                 &scylla_session,

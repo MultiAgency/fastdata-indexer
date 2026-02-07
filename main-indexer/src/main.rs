@@ -13,9 +13,6 @@ use tokio::sync::mpsc;
 
 const FASTDATA_PREFIX: &str = "__fastdata_";
 const PROJECT_ID: &str = "fastdata-indexer";
-const MAX_DATA_SIZE: usize = 4_194_304; // 4MB — matches NEAR protocol max
-const MAX_ENTRIES_PER_BLOCK: usize = 100_000;
-const MAX_DATA_BYTES_PER_BLOCK: usize = 512 * 1024 * 1024; // 512MB total payload cap per block
 
 #[tokio::main]
 async fn main() {
@@ -137,9 +134,8 @@ async fn main() {
         tracing::info!(target: PROJECT_ID, "Received block: {}", block_height);
 
         let mut data = vec![];
-        let mut data_bytes: usize = 0;
 
-        'shards: for shard in block.shards {
+        for shard in block.shards {
             for (receipt_index, reo) in shard.receipt_execution_outcomes.into_iter().enumerate() {
                 let receipt = reo.receipt;
                 let receipt_id = receipt.receipt_id;
@@ -168,23 +164,6 @@ async fn main() {
                                     );
                                     continue;
                                 }
-                                if args.len() > MAX_DATA_SIZE {
-                                    tracing::warn!(
-                                        target: PROJECT_ID,
-                                        "Skipping oversized fastdata ({} bytes) for receipt {} action {}",
-                                        args.len(), receipt_id, action_index
-                                    );
-                                    continue;
-                                }
-                                if data.len() >= MAX_ENTRIES_PER_BLOCK || data_bytes >= MAX_DATA_BYTES_PER_BLOCK {
-                                    tracing::warn!(
-                                        target: PROJECT_ID,
-                                        "Block {} truncated: {} entries, {} bytes",
-                                        block_height, data.len(), data_bytes
-                                    );
-                                    break 'shards;
-                                }
-                                data_bytes += args.len();
                                 data.push(FastData {
                                     receipt_id,
                                     action_index: action_index as _,
