@@ -242,23 +242,23 @@ pub(crate) async fn prepare_kv_edges_insert_query(
 /// - First segment (source) equals `predecessor_id`
 /// - Last segment = target, middle segments joined by `/` = edge_type
 pub(crate) fn extract_edge(key: &str, predecessor_id: &str) -> Option<(String, String, String)> {
+    let key = key.trim_start_matches('/');
     let segments: Vec<&str> = key.split('/').collect();
-    if segments.len() < 3 {
+    if segments.len() < 2 {
         return None;
     }
-    let source = segments[0];
-    if source.is_empty() || source != predecessor_id {
+    if predecessor_id.is_empty() {
         return None;
     }
     let target = segments[segments.len() - 1];
     if target.is_empty() {
         return None;
     }
-    let edge_type = segments[1..segments.len() - 1].join("/");
+    let edge_type = segments[..segments.len() - 1].join("/");
     if edge_type.is_empty() {
         return None;
     }
-    Some((edge_type, source.to_string(), target.to_string()))
+    Some((edge_type, predecessor_id.to_string(), target.to_string()))
 }
 
 const BATCH_CHUNK_SIZE: usize = 100;
@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn test_extract_edge_follow() {
         assert_eq!(
-            extract_edge("alice.near/legion/follow/bob.near", "alice.near"),
+            extract_edge("legion/follow/bob.near", "alice.near"),
             Some(("legion/follow".into(), "alice.near".into(), "bob.near".into()))
         );
     }
@@ -403,7 +403,7 @@ mod tests {
     #[test]
     fn test_extract_edge_graph_follow() {
         assert_eq!(
-            extract_edge("alice.near/graph/follow/bob.near", "alice.near"),
+            extract_edge("graph/follow/bob.near", "alice.near"),
             Some(("graph/follow".into(), "alice.near".into(), "bob.near".into()))
         );
     }
@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn test_extract_edge_single_segment_type() {
         assert_eq!(
-            extract_edge("alice.near/follow/bob.near", "alice.near"),
+            extract_edge("follow/bob.near", "alice.near"),
             Some(("follow".into(), "alice.near".into(), "bob.near".into()))
         );
     }
@@ -419,25 +419,25 @@ mod tests {
     #[test]
     fn test_extract_edge_deep_type() {
         assert_eq!(
-            extract_edge("alice.near/a/b/c/bob.near", "alice.near"),
+            extract_edge("a/b/c/bob.near", "alice.near"),
             Some(("a/b/c".into(), "alice.near".into(), "bob.near".into()))
         );
     }
 
     #[test]
-    fn test_extract_edge_predecessor_mismatch() {
-        assert_eq!(extract_edge("alice.near/legion/follow/bob.near", "carol.near"), None);
+    fn test_extract_edge_empty_predecessor() {
+        assert_eq!(extract_edge("graph/follow/bob.near", ""), None);
     }
 
     #[test]
     fn test_extract_edge_too_few_segments() {
-        assert_eq!(extract_edge("alice.near/bob.near", "alice.near"), None);
+        assert_eq!(extract_edge("bob.near", "alice.near"), None);
     }
 
     #[test]
     fn test_extract_edge_non_account_target() {
         assert_eq!(
-            extract_edge("alice.near/like/post/12345", "alice.near"),
+            extract_edge("like/post/12345", "alice.near"),
             Some(("like/post".into(), "alice.near".into(), "12345".into()))
         );
     }
@@ -445,31 +445,39 @@ mod tests {
     #[test]
     fn test_extract_edge_profile_name() {
         assert_eq!(
-            extract_edge("alice.near/profile/name", "alice.near"),
+            extract_edge("profile/name", "alice.near"),
             Some(("profile".into(), "alice.near".into(), "name".into()))
         );
     }
 
     #[test]
     fn test_extract_edge_empty_target() {
-        assert_eq!(extract_edge("alice.near/legion/follow/", "alice.near"), None);
+        assert_eq!(extract_edge("legion/follow/", "alice.near"), None);
     }
 
     #[test]
     fn test_extract_edge_empty_source() {
-        assert_eq!(extract_edge("/legion/follow/bob.near", ""), None);
+        assert_eq!(extract_edge("graph/follow/bob.near", ""), None);
     }
 
     #[test]
     fn test_extract_edge_no_slash() {
-        assert_eq!(extract_edge("justadata", "justadata"), None);
+        assert_eq!(extract_edge("justadata", "alice.near"), None);
     }
 
     #[test]
     fn test_extract_edge_custom_subscribe() {
         assert_eq!(
-            extract_edge("alice.near/custom/subscribe/channel.near", "alice.near"),
+            extract_edge("custom/subscribe/channel.near", "alice.near"),
             Some(("custom/subscribe".into(), "alice.near".into(), "channel.near".into()))
+        );
+    }
+
+    #[test]
+    fn test_extract_edge_leading_slash() {
+        assert_eq!(
+            extract_edge("/graph/alice.near", "bob.near"),
+            Some(("graph".into(), "bob.near".into(), "alice.near".into()))
         );
     }
 }
