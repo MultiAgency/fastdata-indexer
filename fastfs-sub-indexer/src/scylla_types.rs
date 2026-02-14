@@ -153,11 +153,11 @@ pub(crate) async fn prepare_insert_query(
 pub(crate) async fn add_fastfs_fastdata(
     scylla_db: &ScyllaDb,
     insert_query: &PreparedStatement,
-    fastdata: FastfsFastData,
+    fastdata: &FastfsFastData,
 ) -> anyhow::Result<()> {
     scylla_db
         .scylla_session
-        .execute_unpaged(insert_query, FastfsFastDataRow::from(fastdata))
+        .execute_unpaged(insert_query, FastfsFastDataRow::from(fastdata.clone()))
         .await?;
     Ok(())
 }

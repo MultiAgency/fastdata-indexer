@@ -80,8 +80,14 @@ impl ScyllaDb {
             tracing::warn!("SCYLLA_SSL_CA not set - ScyllaDB connection is unencrypted");
         }
 
-        let session: Session = SessionBuilder::new()
-            .known_node(scylla_url)
+        let mut builder = SessionBuilder::new();
+        for node in scylla_url.split(',') {
+            let node = node.trim();
+            if !node.is_empty() {
+                builder = builder.known_node(node);
+            }
+        }
+        let session: Session = builder
             .tls_context(tls_config)
             .authenticator_provider(Arc::new(
                 scylla::authentication::PlainTextAuthenticator::new(
@@ -168,7 +174,7 @@ impl ScyllaDb {
                 shard_id int,
                 receipt_index int,
                 PRIMARY KEY ((suffix, block_height_bucket), block_height, shard_id, receipt_index, action_index, receipt_id)
-            )",
+            ) WITH default_time_to_live = 2592000", // 30 days TTL — blobs are only needed for sub-indexer replay
             // Secondary indexes on high-cardinality columns removed (ScyllaDB anti-pattern).
             // Use dedicated lookup tables if tx_hash/receipt_id queries are needed.
             "CREATE TABLE IF NOT EXISTS meta (

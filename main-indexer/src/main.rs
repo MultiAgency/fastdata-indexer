@@ -108,8 +108,8 @@ async fn main() {
     let block_update_interval = std::time::Duration::from_millis(
         env::var("BLOCK_UPDATE_INTERVAL_MS")
             .ok()
-            .map(|ms| ms.parse().expect("Invalid number of blocks"))
-            .unwrap_or(5000),
+            .map(|ms| ms.parse().expect("Invalid BLOCK_UPDATE_INTERVAL_MS"))
+            .unwrap_or(5000u64),
     );
 
     tracing::info!(target: PROJECT_ID,

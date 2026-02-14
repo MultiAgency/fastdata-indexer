@@ -1313,6 +1313,7 @@ dependencies = [
  "ctrlc",
  "dotenvy",
  "fastnear-primitives",
+ "futures",
  "scylla",
  "scylladb",
  "serde",
@@ -2371,6 +2372,7 @@ dependencies = [
  "futures",
  "rustls",
  "scylla",
+ "tokio",
  "tracing",
 ]
 

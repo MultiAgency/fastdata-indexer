@@ -33,9 +33,11 @@ NEAR Blockchain
 │  ▼                 │  │  ▼                        │
 │  s_kv (history)    │  │  s_fastfs_v2             │
 │  s_kv_last (latest)│  └─────────────────────────┘
+│  s_kv_by_block     │
 │  kv_accounts       │
 │  kv_reverse        │
 │  kv_edges          │
+│  all_accounts      │
 │  mv_kv_key (MV)    │
 │  mv_kv_cur_key (MV)│
 └────────────────────┘
@@ -55,7 +57,7 @@ Replication: NetworkTopologyStrategy dc1=3, tablets enabled
 | `scylladb/src/utils.rs` | `compute_order_id()` — deterministic ordering from shard/receipt/action indices |
 | `suffix-fetcher/src/lib.rs` | `SuffixFetcher` — polls `blobs` table by suffix, sends `FastData`/`EndOfRange` events to sub-indexers |
 | `kv-sub-indexer/src/main.rs` | KV processing loop: receives FastData, JSON-deserializes, validates, accumulates rows, batch-writes |
-| `kv-sub-indexer/src/scylla_types.rs` | `FastDataKv`/`FastDataKvRow`/`KvEdgeRow` structs, all KV table creation (s_kv, s_kv_last, kv_accounts, kv_edges, kv_reverse, MVs), `add_kv_rows()` batch writer, `extract_edge()` |
+| `kv-sub-indexer/src/scylla_types.rs` | `FastDataKv`/`FastDataKvRow`/`KvEdgeRow`/`KvByBlockRow` structs, all KV table creation (s_kv, s_kv_last, s_kv_by_block, kv_accounts, kv_edges, kv_reverse, all_accounts, MVs), `add_kv_rows()` batch writer, `extract_edge()` |
 | `fastfs-sub-indexer/src/main.rs` | FastFS processing loop: receives FastData, Borsh-deserializes, validates paths/sizes, writes |
 | `fastfs-sub-indexer/src/scylla_types.rs` | `FastfsFastData`/`FastfsFastDataRow`, `s_fastfs_v2` table creation |
 | `fastfs-sub-indexer/src/fastfs.rs` | `SimpleFastfs`/`PartialFastfs` Borsh enums, path validation, size limits |
@@ -64,17 +66,18 @@ Replication: NetworkTopologyStrategy dc1=3, tablets enabled
 
 | # | Table | CQL Location | Batching | Consistency |
 |---|-------|-------------|----------|-------------|
-| 1 | `blobs` | `scylladb/src/lib.rs:120` | Individual, 100 concurrent via `buffer_unordered` | LocalQuorum |
-| 2 | `meta` | `scylladb/src/lib.rs:131` | Individual | LocalQuorum |
-| 3 | `s_kv` | `kv-sub-indexer/src/scylla_types.rs:215` | Unlogged batch, chunks of 100 | LocalQuorum |
-| 4 | `s_kv_last` | `kv-sub-indexer/src/scylla_types.rs:226` | Individual with `USING TIMESTAMP` | LocalQuorum |
-| 5 | `kv_accounts` | `kv-sub-indexer/src/scylla_types.rs:237` | Unlogged batch, chunks of 100 | LocalQuorum |
+| 1 | `blobs` | `scylladb/src/lib.rs:126` | Individual, 100 concurrent via `buffer_unordered` | LocalQuorum |
+| 2 | `meta` | `scylladb/src/lib.rs:137` | Individual | LocalQuorum |
+| 3 | `s_kv` | `kv-sub-indexer/src/scylla_types.rs:246` | Unlogged batch, chunks of 100 | LocalQuorum |
+| 4 | `s_kv_last` | `kv-sub-indexer/src/scylla_types.rs:257` | Individual with `USING TIMESTAMP` | LocalQuorum |
+| 5 | `kv_accounts` | `kv-sub-indexer/src/scylla_types.rs:268` | Unlogged batch, chunks of 100 | LocalQuorum |
 | 6 | `s_fastfs_v2` | `fastfs-sub-indexer/src/scylla_types.rs:147` | Individual | LocalQuorum |
-| 7 | `kv_edges` | `kv-sub-indexer/src/scylla_types.rs:248` | Individual with `USING TIMESTAMP` | LocalQuorum |
-| 8 | `kv_reverse` | `kv-sub-indexer/src/scylla_types.rs:259` | Individual with `USING TIMESTAMP` | LocalQuorum |
-| 9 | `all_accounts` | `kv-sub-indexer/src/scylla_types.rs:275` | Individual with `USING TIMESTAMP` | LocalQuorum |
+| 7 | `kv_edges` | `kv-sub-indexer/src/scylla_types.rs:279` | Individual with `USING TIMESTAMP` | LocalQuorum |
+| 8 | `kv_reverse` | `kv-sub-indexer/src/scylla_types.rs:301` | Individual with `USING TIMESTAMP` | LocalQuorum |
+| 9 | `all_accounts` | `kv-sub-indexer/src/scylla_types.rs:312` | Individual with `USING TIMESTAMP` | LocalQuorum |
+| 10 | `s_kv_by_block` | `kv-sub-indexer/src/scylla_types.rs:323` | Unlogged batch, chunks of 100 | LocalQuorum |
 
-The `add_kv_rows()` function at `kv-sub-indexer/src/scylla_types.rs:293-450` orchestrates writes #3, #4, #5, #7, #8, #9, and an optional checkpoint (#2) in a single call. Deduplication for `s_kv_last` happens at lines 308-322 via explicit `(block_height, order_id)` comparison, keeping the highest value. Writes #4, #7, and #8 use `USING TIMESTAMP` with `block_height * 1B + order_id` to ensure deterministic last-write-wins ordering based on blockchain order rather than wall-clock time.
+The `add_kv_rows()` function at `kv-sub-indexer/src/scylla_types.rs:372-614` orchestrates writes #3, #4, #5, #7, #8, #9, #10, and an optional checkpoint (#2) in a single call. Deduplication for `s_kv_last` happens at lines 383-401 via explicit `(block_height, order_id)` comparison, keeping the highest value. Writes #4, #7, #8, and #9 use `USING TIMESTAMP` with `block_height * 1B + order_id` to ensure deterministic last-write-wins ordering based on blockchain order rather than wall-clock time.
 
 Retry pattern everywhere: exponential backoff `[1s, 2s, 4s]` (sub-indexers) or `[0s, 1s, 2s, 4s]` (main-indexer). Graceful shutdown via `is_running` flag on final failure to prevent data loss.
 
@@ -82,17 +85,18 @@ Retry pattern everywhere: exponential backoff `[1s, 2s, 4s]` (sub-indexers) or `
 
 | # | Object | Type | Location | Partition Key | Clustering Keys |
 |---|--------|------|----------|---------------|-----------------|
-| 1 | `blobs` | TABLE | `scylladb/src/lib.rs:156-171` | `(suffix, block_height_bucket)` | `block_height, shard_id, receipt_index, action_index, receipt_id` |
-| 2 | `meta` | TABLE | `scylladb/src/lib.rs:174-177` | `(suffix)` | — |
-| 3 | `s_kv` | TABLE | `kv-sub-indexer/src/scylla_types.rs:125-141` | `(predecessor_id)` | `current_account_id, key, block_height, order_id` |
-| 4 | `s_kv_last` | TABLE | `kv-sub-indexer/src/scylla_types.rs:142-158` | `(predecessor_id)` | `current_account_id, key` |
-| 5 | `mv_kv_key` | MAT. VIEW | `kv-sub-indexer/src/scylla_types.rs:159-163` | `(key)` | `block_height, order_id, predecessor_id, current_account_id` |
-| 6 | `mv_kv_cur_key` | MAT. VIEW | `kv-sub-indexer/src/scylla_types.rs:164-168` | `(current_account_id)` | `key, block_height, order_id, predecessor_id` |
-| 7 | `kv_accounts` | TABLE | `kv-sub-indexer/src/scylla_types.rs:169-174` | `(current_account_id)` | `key, predecessor_id` |
-| 8 | `kv_edges` | TABLE | `kv-sub-indexer/src/scylla_types.rs:175-185` | `(edge_type, target)` | `source` |
+| 1 | `blobs` | TABLE | `scylladb/src/lib.rs:162-177` | `(suffix, block_height_bucket)` | `block_height, shard_id, receipt_index, action_index, receipt_id` |
+| 2 | `meta` | TABLE | `scylladb/src/lib.rs:180-183` | `(suffix)` | — |
+| 3 | `s_kv` | TABLE | `kv-sub-indexer/src/scylla_types.rs:139-155` | `(predecessor_id)` | `current_account_id, key, block_height, order_id` |
+| 4 | `s_kv_last` | TABLE | `kv-sub-indexer/src/scylla_types.rs:156-172` | `(predecessor_id)` | `current_account_id, key` |
+| 5 | `mv_kv_key` | MAT. VIEW | `kv-sub-indexer/src/scylla_types.rs:173-177` | `(key)` | `block_height, order_id, predecessor_id, current_account_id` |
+| 6 | `mv_kv_cur_key` | MAT. VIEW | `kv-sub-indexer/src/scylla_types.rs:178-182` | `(current_account_id)` | `key, block_height, order_id, predecessor_id` |
+| 7 | `kv_accounts` | TABLE | `kv-sub-indexer/src/scylla_types.rs:183-188` | `(current_account_id)` | `key, predecessor_id` |
+| 8 | `kv_edges` | TABLE | `kv-sub-indexer/src/scylla_types.rs:189-199` | `(edge_type, target)` | `source` |
 | 9 | `s_fastfs_v2` | TABLE | `fastfs-sub-indexer/src/scylla_types.rs:113-131` | `(predecessor_id)` | `current_account_id, relative_path, nonce, offset` |
-| 10 | `kv_reverse` | TABLE | `kv-sub-indexer/src/scylla_types.rs:186-201` | `(current_account_id, key)` | `predecessor_id` |
-| 11 | `all_accounts` | TABLE | `kv-sub-indexer/src/scylla_types.rs:202-206` | `(account_id)` | — |
+| 10 | `kv_reverse` | TABLE | `kv-sub-indexer/src/scylla_types.rs:200-215` | `(current_account_id, key)` | `predecessor_id` |
+| 11 | `all_accounts` | TABLE | `kv-sub-indexer/src/scylla_types.rs:216-220` | `(predecessor_id)` | — |
+| 12 | `s_kv_by_block` | TABLE | `kv-sub-indexer/src/scylla_types.rs:221-232` | `(predecessor_id, current_account_id)` | `block_height DESC, key ASC` |
 
 ## 5. Environment Variables
 

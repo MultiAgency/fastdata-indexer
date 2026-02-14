@@ -9,7 +9,7 @@ use dotenvy::dotenv;
 use fastnear_primitives::near_indexer_primitives::types::BlockHeight;
 use fastnear_primitives::types::ChainId;
 use scylla::statement::prepared::PreparedStatement;
-use scylladb::ScyllaDb;
+use scylladb::{retry_with_delays, ScyllaDb};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -24,35 +24,11 @@ const INDEXER_ID: &str = "fastfs_v2";
 async fn write_with_retries(
     scylladb: &ScyllaDb,
     insert_query: &PreparedStatement,
-    fastdata: FastfsFastData,
+    fastdata: &FastfsFastData,
 ) -> anyhow::Result<()> {
-    let delays = [1, 2, 4];
-    let mut last_error = None;
-
-    for (attempt, &delay_secs) in delays.iter().enumerate() {
-        if attempt > 0 {
-            tracing::warn!(
-                target: PROJECT_ID,
-                "Retrying DB write (attempt {}/{}) after {}s delay",
-                attempt + 1, delays.len(), delay_secs
-            );
-            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-        }
-
-        match add_fastfs_fastdata(scylladb, insert_query, fastdata.clone()).await {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                tracing::error!(
-                    target: PROJECT_ID,
-                    "DB write failed (attempt {}): {:?}",
-                    attempt + 1, e
-                );
-                last_error = Some(e);
-            }
-        }
-    }
-
-    Err(last_error.unwrap())
+    retry_with_delays(&[1, 2, 4], || {
+        add_fastfs_fastdata(scylladb, insert_query, fastdata)
+    }).await
 }
 
 #[tokio::main]
@@ -154,8 +130,10 @@ async fn main() {
                                     .content
                                     .map(|c| (Some(c.mime_type), Some(c.content)))
                                     .unwrap_or((None, None));
-                                let full_size =
-                                    content.as_ref().map(|c| c.len() as u32).unwrap_or(0);
+                                let full_size = content
+                                    .as_ref()
+                                    .map(|c| u32::try_from(c.len()).expect("content length exceeds u32"))
+                                    .unwrap_or(0);
                                 let fastfs_fastdata = FastfsFastData {
                                     receipt_id: fastdata.receipt_id,
                                     action_index: fastdata.action_index,
@@ -176,7 +154,7 @@ async fn main() {
                                 };
                                 tracing::info!(target: PROJECT_ID, "FastFS data {} bytes: {}/{}/{}", fastfs_fastdata.content.as_ref().map(|v| v.len()).unwrap_or(0), fastfs_fastdata.predecessor_id, fastfs_fastdata.current_account_id, fastfs_fastdata.relative_path);
 
-                                if let Err(e) = write_with_retries(&scylladb, &insert_query, fastfs_fastdata).await {
+                                if let Err(e) = write_with_retries(&scylladb, &insert_query, &fastfs_fastdata).await {
                                     tracing::error!(
                                         target: PROJECT_ID,
                                         "Failed to write FastFS data after retries. Shutting down to prevent data loss: {:?}", e
@@ -214,7 +192,7 @@ async fn main() {
                                 };
                                 tracing::info!(target: PROJECT_ID, "FastFS partial data {} bytes: {}/{}/{} offset {}", fastfs_fastdata.content.as_ref().map(|v| v.len()).unwrap_or(0), fastfs_fastdata.predecessor_id, fastfs_fastdata.current_account_id, fastfs_fastdata.relative_path, fastfs_fastdata.offset);
 
-                                if let Err(e) = write_with_retries(&scylladb, &insert_query, fastfs_fastdata).await {
+                                if let Err(e) = write_with_retries(&scylladb, &insert_query, &fastfs_fastdata).await {
                                     tracing::error!(
                                         target: PROJECT_ID,
                                         "Failed to write FastFS partial data after retries. Shutting down to prevent data loss: {:?}", e

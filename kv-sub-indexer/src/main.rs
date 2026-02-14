@@ -1,11 +1,10 @@
 mod scylla_types;
 
-use crate::scylla_types::{add_kv_rows, FastDataKv, INDEXER_ID, SUFFIX};
+use crate::scylla_types::{add_kv_rows, FastDataKv, KvQueries, INDEXER_ID, SUFFIX};
 use dotenvy::dotenv;
 use fastnear_primitives::near_indexer_primitives::types::BlockHeight;
 use fastnear_primitives::types::ChainId;
-use scylla::statement::prepared::PreparedStatement;
-use scylladb::ScyllaDb;
+use scylladb::{retry_with_delays, ScyllaDb};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -90,43 +89,13 @@ fn parse_kv_entries(fastdata: &scylladb::FastData) -> Vec<FastDataKv> {
 
 async fn flush_rows(
     scylladb: &ScyllaDb,
-    kv_insert_query: &PreparedStatement,
-    kv_last_insert_query: &PreparedStatement,
-    kv_accounts_insert_query: &PreparedStatement,
-    kv_edges_insert_query: &PreparedStatement,
-    kv_reverse_insert_query: &PreparedStatement,
-    all_accounts_insert_query: &PreparedStatement,
+    queries: &KvQueries,
     rows: &[FastDataKv],
     checkpoint: Option<BlockHeight>,
 ) -> anyhow::Result<()> {
-    let delays = [1, 2, 4];
-    let mut last_error = None;
-
-    for (attempt, &delay_secs) in delays.iter().enumerate() {
-        if attempt > 0 {
-            tracing::warn!(
-                target: PROJECT_ID,
-                "Retrying DB write (attempt {}/{}) after {}s delay",
-                attempt + 1, delays.len(), delay_secs
-            );
-            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-        }
-
-        match add_kv_rows(scylladb, kv_insert_query, kv_last_insert_query, kv_accounts_insert_query, kv_edges_insert_query, kv_reverse_insert_query, all_accounts_insert_query, rows, checkpoint).await
-        {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                tracing::error!(
-                    target: PROJECT_ID,
-                    "DB write failed (attempt {}): {:?}",
-                    attempt + 1, e
-                );
-                last_error = Some(e);
-            }
-        }
-    }
-
-    Err(last_error.unwrap())
+    retry_with_delays(&[1, 2, 4], || {
+        add_kv_rows(scylladb, queries, rows, checkpoint)
+    }).await
 }
 
 #[tokio::main]
@@ -155,29 +124,16 @@ async fn main() {
         .await
         .expect("Error creating tables");
 
-    let kv_insert_query = scylla_types::prepare_kv_insert_query(&scylladb)
-        .await
-        .expect("Error preparing kv insert query");
-
-    let kv_last_insert_query = scylla_types::prepare_kv_last_insert_query(&scylladb)
-        .await
-        .expect("Error preparing kv insert query");
-
-    let kv_accounts_insert_query = scylla_types::prepare_kv_accounts_insert_query(&scylladb)
-        .await
-        .expect("Error preparing kv_accounts insert query");
-
-    let kv_edges_insert_query = scylla_types::prepare_kv_edges_insert_query(&scylladb)
-        .await
-        .expect("Error preparing kv_edges insert query");
-
-    let kv_reverse_insert_query = scylla_types::prepare_kv_reverse_insert_query(&scylladb)
-        .await
-        .expect("Error preparing kv_reverse insert query");
-
-    let all_accounts_insert_query = scylla_types::prepare_all_accounts_insert_query(&scylladb)
-        .await
-        .expect("Error preparing all_accounts insert query");
+    let queries = KvQueries {
+        kv_insert: scylla_types::prepare_kv_insert_query(&scylladb).await.expect("Error preparing kv insert query"),
+        kv_last_insert: scylla_types::prepare_kv_last_insert_query(&scylladb).await.expect("Error preparing kv_last insert query"),
+        kv_accounts_insert: scylla_types::prepare_kv_accounts_insert_query(&scylladb).await.expect("Error preparing kv_accounts insert query"),
+        kv_edges_insert: scylla_types::prepare_kv_edges_insert_query(&scylladb).await.expect("Error preparing kv_edges insert query"),
+        kv_edges_delete: scylla_types::prepare_kv_edges_delete_query(&scylladb).await.expect("Error preparing kv_edges delete query"),
+        kv_reverse_insert: scylla_types::prepare_kv_reverse_insert_query(&scylladb).await.expect("Error preparing kv_reverse insert query"),
+        all_accounts_insert: scylla_types::prepare_all_accounts_insert_query(&scylladb).await.expect("Error preparing all_accounts insert query"),
+        kv_by_block_insert: scylla_types::prepare_kv_by_block_insert_query(&scylladb).await.expect("Error preparing kv_by_block insert query"),
+    };
 
     let last_processed_block_height = scylladb
         .get_last_processed_block_height(INDEXER_ID)
@@ -234,9 +190,7 @@ async fn main() {
                     let current_rows = std::mem::take(&mut rows);
 
                     if let Err(e) = flush_rows(
-                        &scylladb, &kv_insert_query, &kv_last_insert_query, &kv_accounts_insert_query,
-                        &kv_edges_insert_query, &kv_reverse_insert_query, &all_accounts_insert_query,
-                        &current_rows, None,
+                        &scylladb, &queries, &current_rows, None,
                     ).await {
                         tracing::error!(target: PROJECT_ID,
                             "Failed to write data after retries. Shutting down to prevent data loss: {:?}", e
@@ -251,9 +205,7 @@ async fn main() {
                 let current_rows = std::mem::take(&mut rows);
 
                 if let Err(e) = flush_rows(
-                    &scylladb, &kv_insert_query, &kv_last_insert_query, &kv_accounts_insert_query,
-                    &kv_edges_insert_query, &kv_reverse_insert_query, &all_accounts_insert_query,
-                    &current_rows, Some(block_height),
+                    &scylladb, &queries, &current_rows, Some(block_height),
                 ).await {
                     tracing::error!(target: PROJECT_ID,
                         "Failed to write data after retries. Shutting down to prevent data loss: {:?}", e

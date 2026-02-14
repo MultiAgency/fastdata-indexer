@@ -1,6 +1,7 @@
 use crate::*;
 use fastnear_primitives::near_indexer_primitives::types::AccountId;
 use fastnear_primitives::near_indexer_primitives::CryptoHash;
+use futures::stream::{FuturesUnordered, StreamExt};
 use scylla::serialize::row::SerializeRow;
 use scylla::statement::batch::{Batch, BatchType};
 use scylla::statement::prepared::PreparedStatement;
@@ -57,6 +58,19 @@ pub(crate) struct KvEdgeRow {
     pub block_timestamp: i64,
     pub order_id: i64,
     pub value: String,
+}
+
+#[derive(Debug, Clone, SerializeRow)]
+pub(crate) struct KvByBlockRow {
+    pub predecessor_id: String,
+    pub current_account_id: String,
+    pub block_height: i64,
+    pub key: String,
+    pub value: String,
+    pub block_timestamp: i64,
+    pub order_id: i64,
+    pub receipt_id: String,
+    pub tx_hash: Option<String>,
 }
 
 impl TryFrom<FastDataKvRow> for FastDataKv {
@@ -204,6 +218,18 @@ pub(crate) async fn create_tables(scylla_db: &ScyllaDb) -> anyhow::Result<()> {
             last_block_height bigint,
             last_block_timestamp bigint
         )",
+        "CREATE TABLE IF NOT EXISTS s_kv_by_block (
+            predecessor_id text,
+            current_account_id text,
+            block_height bigint,
+            key text,
+            value text,
+            block_timestamp bigint,
+            order_id bigint,
+            receipt_id text,
+            tx_hash text,
+            PRIMARY KEY ((predecessor_id, current_account_id), block_height, key)
+        ) WITH CLUSTERING ORDER BY (block_height DESC, key ASC)",
     ];
     for query in queries.iter() {
         tracing::debug!(target: SCYLLADB, "Creating table: {}", query);
@@ -256,6 +282,17 @@ pub(crate) async fn prepare_kv_edges_insert_query(
     .await
 }
 
+pub(crate) async fn prepare_kv_edges_delete_query(
+    scylla_db: &ScyllaDb,
+) -> anyhow::Result<PreparedStatement> {
+    ScyllaDb::prepare_query(
+        &scylla_db.scylla_session,
+        "DELETE FROM kv_edges WHERE edge_type = ? AND target = ? AND source = ?",
+        scylla::frame::types::Consistency::LocalQuorum,
+    )
+    .await
+}
+
 pub(crate) async fn prepare_kv_reverse_insert_query(
     scylla_db: &ScyllaDb,
 ) -> anyhow::Result<PreparedStatement> {
@@ -276,6 +313,23 @@ pub(crate) async fn prepare_all_accounts_insert_query(
         scylla::frame::types::Consistency::LocalQuorum,
     )
     .await
+}
+
+pub(crate) async fn prepare_kv_by_block_insert_query(
+    scylla_db: &ScyllaDb,
+) -> anyhow::Result<PreparedStatement> {
+    ScyllaDb::prepare_query(
+        &scylla_db.scylla_session,
+        "INSERT INTO s_kv_by_block (predecessor_id, current_account_id, block_height, key, value, block_timestamp, order_id, receipt_id, tx_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        scylla::frame::types::Consistency::LocalQuorum,
+    )
+    .await
+}
+
+/// Returns true if the value represents a logical deletion of a KV entry.
+/// Currently only JSON null (serialized as the 4-char string "null") counts.
+pub(crate) fn is_edge_deletion(value: &str) -> bool {
+    value == "null"
 }
 
 /// Auto-detects a graph edge from a KV key.
@@ -304,14 +358,20 @@ pub(crate) fn extract_edge(key: &str, predecessor_id: &str) -> Option<(String, S
 
 const BATCH_CHUNK_SIZE: usize = 100;
 
+pub(crate) struct KvQueries {
+    pub kv_insert: PreparedStatement,
+    pub kv_last_insert: PreparedStatement,
+    pub kv_accounts_insert: PreparedStatement,
+    pub kv_edges_insert: PreparedStatement,
+    pub kv_edges_delete: PreparedStatement,
+    pub kv_reverse_insert: PreparedStatement,
+    pub all_accounts_insert: PreparedStatement,
+    pub kv_by_block_insert: PreparedStatement,
+}
+
 pub(crate) async fn add_kv_rows(
     scylla_db: &ScyllaDb,
-    kv_insert_query: &PreparedStatement,
-    kv_last_insert_query: &PreparedStatement,
-    kv_accounts_insert_query: &PreparedStatement,
-    kv_edges_insert_query: &PreparedStatement,
-    kv_reverse_insert_query: &PreparedStatement,
-    all_accounts_insert_query: &PreparedStatement,
+    queries: &KvQueries,
     rows: &[FastDataKv],
     last_processed_block_height: Option<BlockHeight>,
 ) -> anyhow::Result<()> {
@@ -320,119 +380,120 @@ pub(crate) async fn add_kv_rows(
         .cloned()
         .map(FastDataKvRow::from)
         .collect();
-    // Deduplicate kv_rows by key, keeping the row with the highest order_id
-    let mut kv_last_map: HashMap<(String, String, String), FastDataKvRow> = HashMap::new();
-    for row in kv_rows.iter().cloned() {
+    // Deduplicate kv_rows by key, keeping the index of the row with the highest order_id
+    let mut kv_last_map: HashMap<(&str, &str, &str), usize> = HashMap::new();
+    for (i, row) in kv_rows.iter().enumerate() {
         let dedup_key = (
-            row.predecessor_id.clone(),
-            row.current_account_id.clone(),
-            row.key.clone(),
+            row.predecessor_id.as_str(),
+            row.current_account_id.as_str(),
+            row.key.as_str(),
         );
         match kv_last_map.get(&dedup_key) {
-            Some(existing) if (existing.block_height, existing.order_id) >= (row.block_height, row.order_id) => {}
+            Some(&existing_idx) if (kv_rows[existing_idx].block_height, kv_rows[existing_idx].order_id) >= (row.block_height, row.order_id) => {}
             _ => {
-                kv_last_map.insert(dedup_key, row);
+                kv_last_map.insert(dedup_key, i);
             }
         }
     }
-    let mut kv_last_rows: Vec<_> = kv_last_map.into_values().collect();
-    kv_last_rows.sort_by(|a, b| (b.block_height, b.order_id).cmp(&(a.block_height, a.order_id)));
+    let mut kv_last_indices: Vec<usize> = kv_last_map.into_values().collect();
+    kv_last_indices.sort_by(|&a, &b| {
+        (kv_rows[b].block_height, kv_rows[b].order_id).cmp(&(kv_rows[a].block_height, kv_rows[a].order_id))
+    });
 
     // Write kv_rows in chunks
     for chunk in kv_rows.chunks(BATCH_CHUNK_SIZE) {
         let mut batch = Batch::new(BatchType::Unlogged);
         let mut values: Vec<&dyn SerializeRow> = vec![];
         for kv in chunk {
-            batch.append_statement(kv_insert_query.clone());
+            batch.append_statement(queries.kv_insert.clone());
             values.push(kv);
         }
         scylla_db.scylla_session.batch(&batch, values).await?;
     }
 
-    // Write kv_last_rows and kv_reverse with USING TIMESTAMP for deterministic last-write-wins ordering.
-    // This prevents stale overwrites on crash/replay: blockchain ordering always wins
-    // over wall-clock time, regardless of write order or duplicate writes.
-    for kv_last in &kv_last_rows {
-        // Encode (block_height, order_id) into a single i64 timestamp for deterministic LWW.
-        // Max order_id ≈ shard_count * 100_000 * 1_000 ≈ 600M (6 shards). With 1B multiplier,
-        // block_height can reach ~9.2B before i64 overflow (current NEAR height: ~150M).
-        let ts = (kv_last.block_height) * 1_000_000_000 + kv_last.order_id;
-
-        let mut stmt = kv_last_insert_query.clone();
-        stmt.set_timestamp(Some(ts));
-        scylla_db.scylla_session.execute_unpaged(&stmt, kv_last).await?;
-
-        // kv_reverse: same row repartitioned by (current_account_id, key) for cursor pagination
-        let mut stmt = kv_reverse_insert_query.clone();
-        stmt.set_timestamp(Some(ts));
-        let row = (
-            &kv_last.current_account_id, &kv_last.key, &kv_last.predecessor_id,
-            &kv_last.receipt_id, &kv_last.action_index, &kv_last.tx_hash,
-            &kv_last.signer_id, &kv_last.block_height, &kv_last.block_timestamp,
-            &kv_last.shard_id, &kv_last.receipt_index, &kv_last.order_id, &kv_last.value,
-        );
-        scylla_db.scylla_session.execute_unpaged(&stmt, row).await?;
-    }
-
-    // Write kv_accounts (unique tuples from kv_last_rows)
-    let account_tuples: HashSet<(&str, &str, &str)> = kv_last_rows
-        .iter()
-        .map(|row| (
-            row.current_account_id.as_str(),
-            row.key.as_str(),
-            row.predecessor_id.as_str(),
-        ))
-        .collect();
-    let account_tuples_vec: Vec<_> = account_tuples
-        .into_iter()
-        .map(|(a, k, p)| (a.to_string(), k.to_string(), p.to_string()))
-        .collect();
-    for chunk in account_tuples_vec.chunks(BATCH_CHUNK_SIZE) {
+    // Write s_kv_by_block in chunks (same rows as s_kv, repartitioned for timeline queries)
+    for chunk in kv_rows.chunks(BATCH_CHUNK_SIZE) {
         let mut batch = Batch::new(BatchType::Unlogged);
         let mut values: Vec<&dyn SerializeRow> = vec![];
-        for tuple in chunk {
-            batch.append_statement(kv_accounts_insert_query.clone());
-            values.push(tuple);
+        let by_block_rows: Vec<KvByBlockRow> = chunk.iter().map(|r| KvByBlockRow {
+            predecessor_id: r.predecessor_id.clone(),
+            current_account_id: r.current_account_id.clone(),
+            block_height: r.block_height,
+            key: r.key.clone(),
+            value: r.value.clone(),
+            block_timestamp: r.block_timestamp,
+            order_id: r.order_id,
+            receipt_id: r.receipt_id.clone(),
+            tx_hash: r.tx_hash.clone(),
+        }).collect();
+        for row in &by_block_rows {
+            batch.append_statement(queries.kv_by_block_insert.clone());
+            values.push(row);
         }
         scylla_db.scylla_session.batch(&batch, values).await?;
     }
 
-    // Write kv_edges for auto-detected graph edges
-    {
-        let mut edge_rows: Vec<KvEdgeRow> = Vec::new();
-        let mut edge_dedup: HashSet<(String, String, String)> = HashSet::new();
+    // Pre-compute USING TIMESTAMP values for kv_last entries (bail early on overflow).
+    // Encode (block_height, order_id) into a single i64 timestamp for deterministic LWW.
+    // Max order_id ≈ shard_count * 100_000 * 1_000 ≈ 600M (6 shards). With 1B multiplier,
+    // block_height can reach ~9.2B before i64 overflow (current NEAR height: ~150M).
+    let kv_last_timestamps: Vec<(usize, i64)> = kv_last_indices.iter()
+        .map(|&i| {
+            let row = &kv_rows[i];
+            let ts = row.block_height.checked_mul(1_000_000_000)
+                .and_then(|v| v.checked_add(row.order_id))
+                .ok_or_else(|| anyhow::anyhow!(
+                    "USING TIMESTAMP overflow: block_height={}, order_id={}",
+                    row.block_height, row.order_id
+                ))?;
+            Ok((i, ts))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
-        for row in &kv_last_rows {
+    // Pre-compute kv_accounts unique tuples
+    let account_tuples_vec: Vec<(String, String, String)> = {
+        let set: HashSet<(&str, &str, &str)> = kv_last_indices.iter()
+            .map(|&i| {
+                let row = &kv_rows[i];
+                (row.current_account_id.as_str(), row.key.as_str(), row.predecessor_id.as_str())
+            })
+            .collect();
+        set.into_iter().map(|(a, k, p)| (a.to_string(), k.to_string(), p.to_string())).collect()
+    };
+
+    // Pre-compute edge writes (inserts and deletes with timestamps)
+    let mut edge_inserts: Vec<(KvEdgeRow, i64)> = Vec::new();
+    let mut edge_deletes: Vec<((String, String, String), i64)> = Vec::new();
+    {
+        let mut edge_dedup: HashSet<(String, String, String)> = HashSet::new();
+        for &(idx, ts) in &kv_last_timestamps {
+            let row = &kv_rows[idx];
             if let Some((edge_type, source, target)) = extract_edge(&row.key, &row.predecessor_id) {
                 let dedup_key = (edge_type.clone(), target.clone(), source.clone());
-                if !edge_dedup.insert(dedup_key) {
-                    continue;
+                if !edge_dedup.insert(dedup_key) { continue; }
+                if is_edge_deletion(&row.value) {
+                    edge_deletes.push(((edge_type, target, source), ts));
+                } else {
+                    edge_inserts.push((KvEdgeRow {
+                        edge_type,
+                        target,
+                        source,
+                        current_account_id: row.current_account_id.clone(),
+                        block_height: row.block_height,
+                        block_timestamp: row.block_timestamp,
+                        order_id: row.order_id,
+                        value: row.value.clone(),
+                    }, ts));
                 }
-                edge_rows.push(KvEdgeRow {
-                    edge_type,
-                    target,
-                    source,
-                    current_account_id: row.current_account_id.clone(),
-                    block_height: row.block_height,
-                    block_timestamp: row.block_timestamp,
-                    order_id: row.order_id,
-                    value: row.value.clone(),
-                });
             }
-        }
-
-        for edge in &edge_rows {
-            let ts = edge.block_height * 1_000_000_000 + edge.order_id;
-            let mut stmt = kv_edges_insert_query.clone();
-            stmt.set_timestamp(Some(ts));
-            scylla_db.scylla_session.execute_unpaged(&stmt, edge).await?;
         }
     }
 
-    // Write all_accounts: one INSERT per unique predecessor_id, latest block wins via USING TIMESTAMP
-    {
+    // Pre-compute all_accounts writes: (predecessor_id, block_height, block_timestamp, ts)
+    let all_accounts_writes: Vec<(String, i64, i64, i64)> = {
         let mut account_max: HashMap<&str, &FastDataKvRow> = HashMap::new();
-        for row in &kv_last_rows {
+        for &idx in &kv_last_indices {
+            let row = &kv_rows[idx];
             account_max
                 .entry(row.predecessor_id.as_str())
                 .and_modify(|existing| {
@@ -442,18 +503,100 @@ pub(crate) async fn add_kv_rows(
                 })
                 .or_insert(row);
         }
-        for (predecessor_id, row) in &account_max {
+        account_max.into_values().map(|row| {
             let ts = row.block_height.checked_mul(1_000_000_000)
                 .and_then(|v| v.checked_add(row.order_id))
                 .ok_or_else(|| anyhow::anyhow!(
                     "all_accounts USING TIMESTAMP overflow: block_height={}, order_id={}",
                     row.block_height, row.order_id
                 ))?;
-            let mut stmt = all_accounts_insert_query.clone();
-            stmt.set_timestamp(Some(ts));
-            scylla_db.scylla_session.execute_unpaged(&stmt, (predecessor_id, &row.block_height, &row.block_timestamp)).await?;
+            Ok((row.predecessor_id.clone(), row.block_height, row.block_timestamp, ts))
+        }).collect::<anyhow::Result<Vec<_>>>()?
+    };
+
+    let session = &scylla_db.scylla_session;
+
+    // Run independent table writes concurrently via try_join!.
+    // Within each group, use FuturesUnordered for concurrent individual writes.
+    tokio::try_join!(
+        // kv_last + kv_reverse: USING TIMESTAMP per-row writes
+        async {
+            let mut futs = FuturesUnordered::new();
+            for &(idx, ts) in &kv_last_timestamps {
+                let kv_last = &kv_rows[idx];
+                let mut last_stmt = queries.kv_last_insert.clone();
+                last_stmt.set_timestamp(Some(ts));
+                let mut rev_stmt = queries.kv_reverse_insert.clone();
+                rev_stmt.set_timestamp(Some(ts));
+                futs.push(async move {
+                    session.execute_unpaged(&last_stmt, kv_last).await?;
+                    let rev_row = (
+                        &kv_last.current_account_id, &kv_last.key, &kv_last.predecessor_id,
+                        &kv_last.receipt_id, &kv_last.action_index, &kv_last.tx_hash,
+                        &kv_last.signer_id, &kv_last.block_height, &kv_last.block_timestamp,
+                        &kv_last.shard_id, &kv_last.receipt_index, &kv_last.order_id, &kv_last.value,
+                    );
+                    session.execute_unpaged(&rev_stmt, rev_row).await?;
+                    Ok::<(), anyhow::Error>(())
+                });
+            }
+            while let Some(r) = futs.next().await { r?; }
+            Ok::<(), anyhow::Error>(())
+        },
+        // kv_accounts: batched writes (already efficient)
+        async {
+            for chunk in account_tuples_vec.chunks(BATCH_CHUNK_SIZE) {
+                let mut batch = Batch::new(BatchType::Unlogged);
+                let mut values: Vec<&dyn SerializeRow> = vec![];
+                for tuple in chunk {
+                    batch.append_statement(queries.kv_accounts_insert.clone());
+                    values.push(tuple);
+                }
+                session.batch(&batch, values).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        },
+        // kv_edges: USING TIMESTAMP per-row inserts and deletes
+        async {
+            // Edge inserts
+            let mut futs = FuturesUnordered::new();
+            for (edge, ts) in &edge_inserts {
+                let mut stmt = queries.kv_edges_insert.clone();
+                stmt.set_timestamp(Some(*ts));
+                futs.push(async move {
+                    session.execute_unpaged(&stmt, edge).await?;
+                    Ok::<(), anyhow::Error>(())
+                });
+            }
+            while let Some(r) = futs.next().await { r?; }
+            // Edge deletes
+            let mut del_futs = FuturesUnordered::new();
+            for ((edge_type, target, source), ts) in &edge_deletes {
+                let mut stmt = queries.kv_edges_delete.clone();
+                stmt.set_timestamp(Some(*ts));
+                del_futs.push(async move {
+                    session.execute_unpaged(&stmt, (edge_type, target, source)).await?;
+                    Ok::<(), anyhow::Error>(())
+                });
+            }
+            while let Some(r) = del_futs.next().await { r?; }
+            Ok::<(), anyhow::Error>(())
+        },
+        // all_accounts: USING TIMESTAMP per-row writes
+        async {
+            let mut futs = FuturesUnordered::new();
+            for (predecessor_id, block_height, block_timestamp, ts) in &all_accounts_writes {
+                let mut stmt = queries.all_accounts_insert.clone();
+                stmt.set_timestamp(Some(*ts));
+                futs.push(async move {
+                    session.execute_unpaged(&stmt, (predecessor_id, block_height, block_timestamp)).await?;
+                    Ok::<(), anyhow::Error>(())
+                });
+            }
+            while let Some(r) = futs.next().await { r?; }
+            Ok::<(), anyhow::Error>(())
         }
-    }
+    )?;
 
     // Write checkpoint only when a block height is provided
     if let Some(height) = last_processed_block_height {
@@ -561,5 +704,21 @@ mod tests {
             extract_edge("/graph/alice.near", "bob.near"),
             Some(("graph".into(), "bob.near".into(), "alice.near".into()))
         );
+    }
+
+    #[test]
+    fn test_is_edge_deletion_null() {
+        assert!(is_edge_deletion("null"));
+    }
+
+    #[test]
+    fn test_is_edge_deletion_non_null() {
+        assert!(!is_edge_deletion("\"hello\""));
+    }
+
+    #[test]
+    fn test_is_edge_deletion_null_string_value() {
+        // JSON string "null" (\"null\") is NOT JSON null (null)
+        assert!(!is_edge_deletion("\"null\""));
     }
 }

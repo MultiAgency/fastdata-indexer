@@ -12,6 +12,7 @@ fastnear-primitives.workspace = true
 tracing.workspace = true
 scylla.workspace = true
 anyhow.workspace = true
+tokio.workspace = true
 rustls.workspace = true
 futures.workspace = true
 
